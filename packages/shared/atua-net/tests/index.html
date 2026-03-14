@@ -1,0 +1,26 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>atua-net test harness</title>
+</head>
+<body>
+  <h1>atua-net test harness</h1>
+  <script type="module">
+    // Import the WASM bindings directly for testing
+    import init, { atua_fetch, atua_connect } from '../wasm-pkg/atua_net.js';
+
+    // Make available globally for Playwright
+    window.__atuaNet = { init, atua_fetch, atua_connect };
+    window.__atuaNetReady = false;
+
+    init().then(() => {
+      window.__atuaNetReady = true;
+      console.log('atua-net WASM initialized');
+    }).catch(err => {
+      window.__atuaNetError = err.toString();
+      console.error('atua-net WASM init failed:', err);
+    });
+  </script>
+</body>
+</html>

@@ -1,0 +1,22 @@
+{
+  "name": "@aspect/atua-net",
+  "version": "0.1.0",
+  "license": "MIT",
+  "description": "Browser WASM networking: HTTPS fetch and raw TCP/TLS via Wisp relay",
+  "type": "module",
+  "main": "pkg/atua-net.js",
+  "files": [
+    "pkg/"
+  ],
+  "scripts": {
+    "build": "wasm-pack build --target web --out-dir wasm-pkg && node scripts/post-build.js",
+    "test": "npx playwright test",
+    "test:rust": "cargo test"
+  },
+  "dependencies": {
+    "wisp-client-js": "^1.0.0"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.40.0"
+  }
+}
