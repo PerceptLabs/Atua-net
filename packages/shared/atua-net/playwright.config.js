@@ -12,5 +12,6 @@ export default defineConfig({
     command: 'node tests/serve.js',
     port: 3456,
     reuseExistingServer: true,
+    timeout: 15000,
   },
 });
