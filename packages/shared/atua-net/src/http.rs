@@ -41,6 +41,7 @@ pub enum FeedResult {
     /// Need more data before we can produce output.
     NeedMore,
     /// A chunk of body data is available (for streaming).
+    #[allow(dead_code)]
     Chunk(Vec<u8>),
     /// Response is complete.
     Complete(Response),
@@ -290,10 +291,6 @@ impl ResponseParser {
         self.headers_complete
     }
 
-    pub fn status(&self) -> u16 {
-        self.status
-    }
-
     pub fn has_content_length(&self) -> bool {
         self.content_length.is_some()
     }
@@ -306,6 +303,8 @@ impl ResponseParser {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ─── Request Serialization ─────────────────────────────────
 
     #[test]
     fn serialize_get_request() {
@@ -333,6 +332,114 @@ mod tests {
     }
 
     #[test]
+    fn serialize_get_no_headers() {
+        let data = serialize_request("GET", "/", "example.com", &[], None);
+        let s = String::from_utf8(data).unwrap();
+        assert_eq!(s, "GET / HTTP/1.1\r\nHost: example.com\r\n\r\n");
+    }
+
+    #[test]
+    fn serialize_skips_duplicate_host_header() {
+        let data = serialize_request(
+            "GET",
+            "/",
+            "example.com",
+            &[("Host".into(), "other.com".into())],
+            None,
+        );
+        let s = String::from_utf8(data).unwrap();
+        // Should only have one Host header (the one we add)
+        assert_eq!(s.matches("Host:").count(), 1);
+        assert!(s.contains("Host: example.com"));
+    }
+
+    #[test]
+    fn serialize_post_with_explicit_content_length() {
+        let body = b"abc";
+        let data = serialize_request(
+            "POST",
+            "/",
+            "example.com",
+            &[("Content-Length".into(), "3".into())],
+            Some(body),
+        );
+        let s = String::from_utf8(data).unwrap();
+        // Should not add a duplicate Content-Length
+        assert_eq!(s.matches("Content-Length:").count(), 1);
+    }
+
+    #[test]
+    fn serialize_post_empty_body() {
+        let data = serialize_request("POST", "/", "example.com", &[], Some(b""));
+        let s = String::from_utf8(data).unwrap();
+        assert!(s.contains("Content-Length: 0\r\n"));
+    }
+
+    #[test]
+    fn serialize_multiple_headers() {
+        let data = serialize_request(
+            "POST",
+            "/v1/messages",
+            "api.anthropic.com",
+            &[
+                ("Content-Type".into(), "application/json".into()),
+                ("X-Api-Key".into(), "sk-ant-test".into()),
+                (
+                    "anthropic-dangerous-direct-browser-access".into(),
+                    "true".into(),
+                ),
+            ],
+            Some(b"{}"),
+        );
+        let s = String::from_utf8(data).unwrap();
+        assert!(s.contains("Content-Type: application/json\r\n"));
+        assert!(s.contains("X-Api-Key: sk-ant-test\r\n"));
+        assert!(s.contains("anthropic-dangerous-direct-browser-access: true\r\n"));
+        assert!(s.contains("Content-Length: 2\r\n"));
+    }
+
+    #[test]
+    fn serialize_large_body() {
+        let body = vec![0x42u8; 50_000];
+        let data = serialize_request("POST", "/", "example.com", &[], Some(&body));
+        let s = String::from_utf8_lossy(&data);
+        assert!(s.contains("Content-Length: 50000\r\n"));
+        assert_eq!(data.len(), data.len()); // sanity
+        // Verify body is at the end
+        let header_end = data
+            .windows(4)
+            .position(|w| w == b"\r\n\r\n")
+            .unwrap();
+        assert_eq!(&data[header_end + 4..], &body[..]);
+    }
+
+    #[test]
+    fn serialize_path_with_query_string() {
+        let data = serialize_request(
+            "GET",
+            "/search?q=hello&page=2",
+            "example.com",
+            &[],
+            None,
+        );
+        let s = String::from_utf8(data).unwrap();
+        assert!(s.starts_with("GET /search?q=hello&page=2 HTTP/1.1\r\n"));
+    }
+
+    #[test]
+    fn serialize_binary_body() {
+        let body: Vec<u8> = (0..=255).collect();
+        let data = serialize_request("POST", "/upload", "example.com", &[], Some(&body));
+        let header_end = data
+            .windows(4)
+            .position(|w| w == b"\r\n\r\n")
+            .unwrap();
+        assert_eq!(&data[header_end + 4..], &body[..]);
+    }
+
+    // ─── Response Parsing: Basic ───────────────────────────────
+
+    #[test]
     fn parse_simple_response() {
         let raw = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello";
         let mut parser = ResponseParser::new();
@@ -340,36 +447,6 @@ mod tests {
             FeedResult::Complete(resp) => {
                 assert_eq!(resp.status, 200);
                 assert_eq!(resp.body, b"hello");
-            }
-            other => panic!("expected Complete, got {:?}", other),
-        }
-    }
-
-    #[test]
-    fn parse_chunked_response() {
-        let raw = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n";
-        let mut parser = ResponseParser::new();
-        match parser.feed(raw).unwrap() {
-            FeedResult::Complete(resp) => {
-                assert_eq!(resp.status, 200);
-                assert_eq!(resp.body, b"hello world");
-            }
-            other => panic!("expected Complete, got {:?}", other),
-        }
-    }
-
-    #[test]
-    fn parse_split_headers() {
-        let mut parser = ResponseParser::new();
-        // Feed headers in two parts
-        match parser.feed(b"HTTP/1.1 200 OK\r\nContent").unwrap() {
-            FeedResult::NeedMore => {}
-            other => panic!("expected NeedMore, got {:?}", other),
-        }
-        match parser.feed(b"-Length: 3\r\n\r\nabc").unwrap() {
-            FeedResult::Complete(resp) => {
-                assert_eq!(resp.status, 200);
-                assert_eq!(resp.body, b"abc");
             }
             other => panic!("expected Complete, got {:?}", other),
         }
@@ -389,9 +466,191 @@ mod tests {
     }
 
     #[test]
+    fn parse_304_no_body() {
+        let raw = b"HTTP/1.1 304 Not Modified\r\nETag: \"abc\"\r\n\r\n";
+        let mut parser = ResponseParser::new();
+        match parser.feed(raw).unwrap() {
+            FeedResult::Complete(resp) => {
+                assert_eq!(resp.status, 304);
+                assert!(resp.body.is_empty());
+            }
+            other => panic!("expected Complete, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_404_with_body() {
+        let raw = b"HTTP/1.1 404 Not Found\r\nContent-Length: 9\r\n\r\nNot Found";
+        let mut parser = ResponseParser::new();
+        match parser.feed(raw).unwrap() {
+            FeedResult::Complete(resp) => {
+                assert_eq!(resp.status, 404);
+                assert_eq!(resp.body, b"Not Found");
+            }
+            other => panic!("expected Complete, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_500_with_body() {
+        let raw = b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 5\r\n\r\nerror";
+        let mut parser = ResponseParser::new();
+        match parser.feed(raw).unwrap() {
+            FeedResult::Complete(resp) => {
+                assert_eq!(resp.status, 500);
+                assert_eq!(resp.body, b"error");
+            }
+            other => panic!("expected Complete, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_content_length_zero() {
+        let raw = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
+        let mut parser = ResponseParser::new();
+        match parser.feed(raw).unwrap() {
+            FeedResult::Complete(resp) => {
+                assert_eq!(resp.status, 200);
+                assert!(resp.body.is_empty());
+            }
+            other => panic!("expected Complete, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_multiple_headers_preserved() {
+        let raw = b"HTTP/1.1 200 OK\r\nX-A: 1\r\nX-B: 2\r\nX-C: 3\r\nContent-Length: 2\r\n\r\nok";
+        let mut parser = ResponseParser::new();
+        match parser.feed(raw).unwrap() {
+            FeedResult::Complete(resp) => {
+                assert_eq!(resp.status, 200);
+                assert_eq!(resp.headers.len(), 4);
+                assert!(resp.headers.iter().any(|(k, v)| k == "X-A" && v == "1"));
+                assert!(resp.headers.iter().any(|(k, v)| k == "X-B" && v == "2"));
+                assert!(resp.headers.iter().any(|(k, v)| k == "X-C" && v == "3"));
+            }
+            other => panic!("expected Complete, got {:?}", other),
+        }
+    }
+
+    // ─── Response Parsing: Split Input ─────────────────────────
+
+    #[test]
+    fn parse_split_headers() {
+        let mut parser = ResponseParser::new();
+        match parser.feed(b"HTTP/1.1 200 OK\r\nContent").unwrap() {
+            FeedResult::NeedMore => {}
+            other => panic!("expected NeedMore, got {:?}", other),
+        }
+        match parser.feed(b"-Length: 3\r\n\r\nabc").unwrap() {
+            FeedResult::Complete(resp) => {
+                assert_eq!(resp.status, 200);
+                assert_eq!(resp.body, b"abc");
+            }
+            other => panic!("expected Complete, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_body_arrives_after_headers() {
+        let mut parser = ResponseParser::new();
+        match parser.feed(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n").unwrap() {
+            FeedResult::NeedMore => {}
+            other => panic!("expected NeedMore, got {:?}", other),
+        }
+        match parser.feed(b"hello").unwrap() {
+            FeedResult::Complete(resp) => {
+                assert_eq!(resp.body, b"hello");
+            }
+            other => panic!("expected Complete, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_body_in_multiple_chunks() {
+        let mut parser = ResponseParser::new();
+        match parser.feed(b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\n").unwrap() {
+            FeedResult::NeedMore => {}
+            other => panic!("expected NeedMore, got {:?}", other),
+        }
+        match parser.feed(b"hel").unwrap() {
+            FeedResult::Chunk(_) => {}
+            other => panic!("expected Chunk, got {:?}", other),
+        }
+        match parser.feed(b"lo ").unwrap() {
+            FeedResult::Chunk(_) => {}
+            other => panic!("expected Chunk, got {:?}", other),
+        }
+        // After "hel" + "lo " + "worl" = 10 bytes total, which equals Content-Length.
+        // Parser correctly returns Complete here.
+        match parser.feed(b"worl").unwrap() {
+            FeedResult::Complete(resp) => {
+                assert_eq!(resp.body, b"hello worl");
+                assert_eq!(resp.body.len(), 10);
+            }
+            other => panic!("expected Complete, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_body_arrives_byte_by_byte() {
+        let mut parser = ResponseParser::new();
+        parser
+            .feed(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n")
+            .unwrap();
+        for &b in b"hell" {
+            match parser.feed(&[b]).unwrap() {
+                FeedResult::Chunk(_) => {}
+                FeedResult::NeedMore => {}
+                other => panic!("unexpected {:?}", other),
+            }
+        }
+        match parser.feed(b"o").unwrap() {
+            FeedResult::Complete(resp) => {
+                assert_eq!(resp.body, b"hello");
+            }
+            other => panic!("expected Complete, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_headers_split_at_crlf() {
+        let mut parser = ResponseParser::new();
+        match parser.feed(b"HTTP/1.1 200 OK\r\n").unwrap() {
+            FeedResult::NeedMore => {}
+            other => panic!("expected NeedMore, got {:?}", other),
+        }
+        match parser.feed(b"Content-Length: 2\r\n").unwrap() {
+            FeedResult::NeedMore => {}
+            other => panic!("expected NeedMore, got {:?}", other),
+        }
+        match parser.feed(b"\r\nhi").unwrap() {
+            FeedResult::Complete(resp) => {
+                assert_eq!(resp.status, 200);
+                assert_eq!(resp.body, b"hi");
+            }
+            other => panic!("expected Complete, got {:?}", other),
+        }
+    }
+
+    // ─── Response Parsing: Chunked Transfer ────────────────────
+
+    #[test]
+    fn parse_chunked_response() {
+        let raw = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n";
+        let mut parser = ResponseParser::new();
+        match parser.feed(raw).unwrap() {
+            FeedResult::Complete(resp) => {
+                assert_eq!(resp.status, 200);
+                assert_eq!(resp.body, b"hello world");
+            }
+            other => panic!("expected Complete, got {:?}", other),
+        }
+    }
+
+    #[test]
     fn parse_chunked_split_across_feeds() {
         let mut parser = ResponseParser::new();
-        // Headers + partial chunk
         match parser
             .feed(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhel")
             .unwrap()
@@ -399,12 +658,304 @@ mod tests {
             FeedResult::NeedMore => {}
             other => panic!("expected NeedMore, got {:?}", other),
         }
-        // Rest of first chunk + second chunk + terminator
         match parser.feed(b"lo\r\n3\r\nabc\r\n0\r\n\r\n").unwrap() {
             FeedResult::Complete(resp) => {
                 assert_eq!(resp.body, b"helloabc");
             }
             other => panic!("expected Complete, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn parse_chunked_single_byte_feeds() {
+        let raw = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n0\r\n\r\n";
+        let mut parser = ResponseParser::new();
+
+        // Feed headers all at once
+        let header_end = raw
+            .windows(4)
+            .position(|w| w == b"\r\n\r\n")
+            .unwrap()
+            + 4;
+        match parser.feed(&raw[..header_end]).unwrap() {
+            FeedResult::NeedMore => {}
+            other => panic!("expected NeedMore after headers, got {:?}", other),
+        }
+
+        // Feed body byte by byte
+        let body_bytes = &raw[header_end..];
+        let mut completed = false;
+        for &b in body_bytes.iter() {
+            match parser.feed(&[b]).unwrap() {
+                FeedResult::Complete(resp) => {
+                    assert_eq!(resp.body, b"abc");
+                    completed = true;
+                    break;
+                }
+                FeedResult::NeedMore => {}
+                FeedResult::Chunk(_) => {}
+            }
+        }
+        assert!(completed, "should have completed chunked response");
+    }
+
+    #[test]
+    fn parse_chunked_size_split_at_cr() {
+        let mut parser = ResponseParser::new();
+        parser
+            .feed(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n")
+            .unwrap();
+
+        // Split the chunk size "3\r\n" at every byte boundary
+        match parser.feed(b"3").unwrap() {
+            FeedResult::NeedMore => {}
+            other => panic!("expected NeedMore, got {:?}", other),
+        }
+        match parser.feed(b"\r").unwrap() {
+            FeedResult::NeedMore => {}
+            other => panic!("expected NeedMore, got {:?}", other),
+        }
+        match parser.feed(b"\nabc\r\n0\r\n\r\n").unwrap() {
+            FeedResult::Complete(resp) => {
+                assert_eq!(resp.body, b"abc");
+            }
+            other => panic!("expected Complete, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_chunked_with_extension() {
+        // Chunk extensions after size (e.g., "5;ext=val\r\n")
+        let raw = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5;ext=val\r\nhello\r\n0\r\n\r\n";
+        let mut parser = ResponseParser::new();
+        match parser.feed(raw).unwrap() {
+            FeedResult::Complete(resp) => {
+                assert_eq!(resp.body, b"hello");
+            }
+            other => panic!("expected Complete, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_chunked_hex_sizes() {
+        // Chunks with hex sizes: a (10), ff (255)
+        let mut data = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n".to_vec();
+
+        // Chunk of size 0xa (10 bytes)
+        data.extend_from_slice(b"a\r\n");
+        data.extend_from_slice(&[b'X'; 10]);
+        data.extend_from_slice(b"\r\n");
+
+        // Chunk of size 0xff (255 bytes)
+        data.extend_from_slice(b"ff\r\n");
+        data.extend_from_slice(&[b'Y'; 255]);
+        data.extend_from_slice(b"\r\n");
+
+        // Terminator
+        data.extend_from_slice(b"0\r\n\r\n");
+
+        let mut parser = ResponseParser::new();
+        match parser.feed(&data).unwrap() {
+            FeedResult::Complete(resp) => {
+                assert_eq!(resp.body.len(), 265);
+                assert!(resp.body[..10].iter().all(|&b| b == b'X'));
+                assert!(resp.body[10..].iter().all(|&b| b == b'Y'));
+            }
+            other => panic!("expected Complete, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_chunked_many_small_chunks() {
+        let mut data = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n".to_vec();
+        let mut expected_body = Vec::new();
+
+        for i in 0..50u8 {
+            let chunk = format!("{}", i);
+            data.extend_from_slice(format!("{:x}\r\n", chunk.len()).as_bytes());
+            data.extend_from_slice(chunk.as_bytes());
+            data.extend_from_slice(b"\r\n");
+            expected_body.extend_from_slice(chunk.as_bytes());
+        }
+        data.extend_from_slice(b"0\r\n\r\n");
+
+        let mut parser = ResponseParser::new();
+        match parser.feed(&data).unwrap() {
+            FeedResult::Complete(resp) => {
+                assert_eq!(resp.body, expected_body);
+            }
+            other => panic!("expected Complete, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_chunked_large_chunk() {
+        let chunk_size = 100_000;
+        let mut data = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n".to_vec();
+        data.extend_from_slice(format!("{:x}\r\n", chunk_size).as_bytes());
+        let body_content: Vec<u8> = (0..chunk_size).map(|i| (i % 256) as u8).collect();
+        data.extend_from_slice(&body_content);
+        data.extend_from_slice(b"\r\n0\r\n\r\n");
+
+        let mut parser = ResponseParser::new();
+        match parser.feed(&data).unwrap() {
+            FeedResult::Complete(resp) => {
+                assert_eq!(resp.body.len(), chunk_size);
+                assert_eq!(resp.body, body_content);
+            }
+            other => panic!("expected Complete, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_chunked_trailer_split() {
+        let mut parser = ResponseParser::new();
+        parser
+            .feed(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n")
+            .unwrap();
+
+        // Feed chunk data, but split the trailing \r\n
+        match parser.feed(b"5\r\nhello").unwrap() {
+            FeedResult::NeedMore => {}
+            other => panic!("expected NeedMore, got {:?}", other),
+        }
+        // Just the \r
+        match parser.feed(b"\r").unwrap() {
+            FeedResult::NeedMore => {}
+            other => panic!("expected NeedMore, got {:?}", other),
+        }
+        // The \n and then terminator
+        match parser.feed(b"\n0\r\n\r\n").unwrap() {
+            FeedResult::Complete(resp) => {
+                assert_eq!(resp.body, b"hello");
+            }
+            other => panic!("expected Complete, got {:?}", other),
+        }
+    }
+
+    // ─── Response Parsing: Content-Length Edge Cases ────────────
+
+    #[test]
+    fn parse_large_content_length_response() {
+        let body_size = 1_000_000;
+        let header = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n",
+            body_size
+        );
+        let body: Vec<u8> = (0..body_size).map(|i| (i % 256) as u8).collect();
+        let mut full = header.into_bytes();
+        full.extend_from_slice(&body);
+
+        let mut parser = ResponseParser::new();
+        match parser.feed(&full).unwrap() {
+            FeedResult::Complete(resp) => {
+                assert_eq!(resp.body.len(), body_size);
+                assert_eq!(resp.body, body);
+            }
+            other => panic!("expected Complete, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_body_excess_data_truncated() {
+        // Server sends more bytes than Content-Length — we should truncate
+        let raw = b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\nabcDEF";
+        let mut parser = ResponseParser::new();
+        match parser.feed(raw).unwrap() {
+            FeedResult::Complete(resp) => {
+                assert_eq!(resp.body, b"abc");
+            }
+            other => panic!("expected Complete, got {:?}", other),
+        }
+    }
+
+    // ─── Response Parsing: Connection-Close Framing ────────────
+
+    #[test]
+    fn parse_no_content_length_no_chunked() {
+        // No Content-Length, no chunked — connection close framing
+        let mut parser = ResponseParser::new();
+        match parser
+            .feed(b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\nsome data")
+            .unwrap()
+        {
+            FeedResult::Chunk(chunk) => {
+                assert_eq!(chunk, b"some data");
+            }
+            other => panic!("expected Chunk, got {:?}", other),
+        }
+
+        // Feed more data
+        match parser.feed(b" more data").unwrap() {
+            FeedResult::Chunk(chunk) => {
+                assert_eq!(chunk, b" more data");
+            }
+            other => panic!("expected Chunk, got {:?}", other),
+        }
+
+        // Finalize on connection close
+        let resp = parser.finish_no_length();
+        assert_eq!(resp.status, 200);
+        assert_eq!(resp.body, b"some data more data");
+    }
+
+    // ─── Response Parsing: Status Codes ────────────────────────
+
+    #[test]
+    fn parse_100_continue() {
+        let raw = b"HTTP/1.1 100 Continue\r\n\r\n";
+        let mut parser = ResponseParser::new();
+        match parser.feed(raw).unwrap() {
+            FeedResult::Complete(resp) => {
+                assert_eq!(resp.status, 100);
+                assert!(resp.body.is_empty());
+            }
+            other => panic!("expected Complete, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_301_redirect() {
+        let raw = b"HTTP/1.1 301 Moved Permanently\r\nLocation: https://new.example.com/\r\nContent-Length: 0\r\n\r\n";
+        let mut parser = ResponseParser::new();
+        match parser.feed(raw).unwrap() {
+            FeedResult::Complete(resp) => {
+                assert_eq!(resp.status, 301);
+                assert!(resp.body.is_empty());
+                assert!(resp
+                    .headers
+                    .iter()
+                    .any(|(k, v)| k == "Location" && v == "https://new.example.com/"));
+            }
+            other => panic!("expected Complete, got {:?}", other),
+        }
+    }
+
+    // ─── Parser State ──────────────────────────────────────────
+
+    #[test]
+    fn parser_state_methods() {
+        let mut parser = ResponseParser::new();
+        assert!(!parser.headers_done());
+        assert!(!parser.has_content_length());
+        assert!(!parser.is_chunked());
+
+        parser
+            .feed(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n")
+            .unwrap();
+        assert!(parser.headers_done());
+        assert!(parser.has_content_length());
+        assert!(!parser.is_chunked());
+    }
+
+    #[test]
+    fn parser_state_chunked() {
+        let mut parser = ResponseParser::new();
+        parser
+            .feed(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n")
+            .unwrap();
+        assert!(parser.headers_done());
+        assert!(!parser.has_content_length());
+        assert!(parser.is_chunked());
     }
 }

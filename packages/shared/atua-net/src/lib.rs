@@ -342,7 +342,7 @@ async fn atua_connect_inner(
     wisp_send: js_sys::Function,
     wisp_recv: js_sys::Function,
     wisp_open: js_sys::Function,
-    wisp_close: js_sys::Function,
+    _wisp_close: js_sys::Function,
 ) -> Result<JsValue, String> {
     // Open Wisp stream
     let stream_id = call_js_async(
@@ -354,12 +354,6 @@ async fn atua_connect_inner(
     if use_tls {
         let mut bridge = tls::TlsBridge::new(&host)?;
         do_handshake(&mut bridge, &stream_id, &wisp_send, &wisp_recv).await?;
-
-        // Return a handle object. Since we can't easily hold mutable state
-        // across JS calls in WASM without closures, we serialize TLS bridge
-        // state into closures.
-        // For the raw stream API we use a simpler approach: return stream_id
-        // and the callbacks, letting the JS wrapper manage the TLS layer.
     }
 
     // Return stream handle info for JS wrapper to manage
@@ -375,6 +369,8 @@ async fn atua_connect_inner(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ─── URL Parsing ───────────────────────────────────────────
 
     #[test]
     fn parse_https_url() {
@@ -401,13 +397,107 @@ mod tests {
     }
 
     #[test]
+    fn parse_url_with_query_string() {
+        let (host, port, path) =
+            parse_url("https://httpbin.org/get?foo=bar&baz=qux").unwrap();
+        assert_eq!(host, "httpbin.org");
+        assert_eq!(port, 443);
+        assert_eq!(path, "/get?foo=bar&baz=qux");
+    }
+
+    #[test]
+    fn parse_url_with_fragment() {
+        let (host, _, path) = parse_url("https://example.com/page#section").unwrap();
+        assert_eq!(host, "example.com");
+        assert_eq!(path, "/page#section");
+    }
+
+    #[test]
+    fn parse_url_root_path() {
+        let (host, _, path) = parse_url("https://example.com/").unwrap();
+        assert_eq!(host, "example.com");
+        assert_eq!(path, "/");
+    }
+
+    #[test]
+    fn parse_url_deep_path() {
+        let (_, _, path) =
+            parse_url("https://example.com/a/b/c/d/e/file.json").unwrap();
+        assert_eq!(path, "/a/b/c/d/e/file.json");
+    }
+
+    #[test]
+    fn parse_url_port_443() {
+        let (host, port, _) = parse_url("https://example.com:443/").unwrap();
+        assert_eq!(host, "example.com");
+        assert_eq!(port, 443);
+    }
+
+    #[test]
+    fn parse_url_port_8080() {
+        let (host, port, _) = parse_url("https://example.com:8080/api").unwrap();
+        assert_eq!(host, "example.com");
+        assert_eq!(port, 8080);
+    }
+
+    #[test]
+    fn parse_url_subdomain() {
+        let (host, _, _) = parse_url("https://sub.domain.example.com/").unwrap();
+        assert_eq!(host, "sub.domain.example.com");
+    }
+
+    #[test]
+    fn parse_url_with_whitespace() {
+        let (host, _, _) = parse_url("  https://example.com/  ").unwrap();
+        assert_eq!(host, "example.com");
+    }
+
+    #[test]
     fn rejects_http_url() {
         assert!(parse_url("http://example.com").is_err());
     }
 
     #[test]
+    fn rejects_empty_url() {
+        assert!(parse_url("").is_err());
+    }
+
+    #[test]
+    fn rejects_no_scheme() {
+        assert!(parse_url("example.com").is_err());
+    }
+
+    #[test]
+    fn rejects_ftp_url() {
+        assert!(parse_url("ftp://example.com").is_err());
+    }
+
+    #[test]
+    fn rejects_just_scheme() {
+        assert!(parse_url("https://").is_err());
+    }
+
+    #[test]
+    fn rejects_invalid_port() {
+        assert!(parse_url("https://example.com:notaport/").is_err());
+    }
+
+    #[test]
+    fn rejects_port_overflow() {
+        assert!(parse_url("https://example.com:99999/").is_err());
+    }
+
+    // ─── JSON Header Parsing ───────────────────────────────────
+
+    #[test]
     fn parse_empty_headers() {
         let h = parse_headers_json("{}").unwrap();
+        assert!(h.is_empty());
+    }
+
+    #[test]
+    fn parse_empty_string_headers() {
+        let h = parse_headers_json("").unwrap();
         assert!(h.is_empty());
     }
 
@@ -420,5 +510,68 @@ mod tests {
         assert_eq!(h[0].1, "application/json");
         assert_eq!(h[1].0, "X-Key");
         assert_eq!(h[1].1, "abc");
+    }
+
+    #[test]
+    fn parse_headers_with_escaped_chars() {
+        let h = parse_headers_json(r#"{"Key": "value with \"quotes\""}"#).unwrap();
+        assert_eq!(h.len(), 1);
+        assert_eq!(h[0].1, r#"value with "quotes""#);
+    }
+
+    #[test]
+    fn parse_headers_with_special_values() {
+        let h = parse_headers_json(r#"{"Authorization": "Bearer sk-ant-api03-abc123"}"#).unwrap();
+        assert_eq!(h[0].1, "Bearer sk-ant-api03-abc123");
+    }
+
+    #[test]
+    fn parse_headers_with_backslash() {
+        let h = parse_headers_json(r#"{"Key": "path\\to\\file"}"#).unwrap();
+        assert_eq!(h[0].1, r"path\to\file");
+    }
+
+    #[test]
+    fn parse_headers_single() {
+        let h = parse_headers_json(r#"{"Accept": "*/*"}"#).unwrap();
+        assert_eq!(h.len(), 1);
+        assert_eq!(h[0].0, "Accept");
+        assert_eq!(h[0].1, "*/*");
+    }
+
+    #[test]
+    fn parse_headers_many() {
+        let h = parse_headers_json(
+            r#"{"A": "1", "B": "2", "C": "3", "D": "4", "E": "5"}"#,
+        )
+        .unwrap();
+        assert_eq!(h.len(), 5);
+    }
+
+    #[test]
+    fn parse_headers_whitespace_padded() {
+        let h = parse_headers_json(r#"  { "Key" : "Value" }  "#).unwrap();
+        assert_eq!(h.len(), 1);
+        assert_eq!(h[0].0, "Key");
+        assert_eq!(h[0].1, "Value");
+    }
+
+    #[test]
+    fn parse_headers_rejects_invalid_json() {
+        assert!(parse_headers_json("not json").is_err());
+        assert!(parse_headers_json("[1,2,3]").is_err());
+        assert!(parse_headers_json("{invalid}").is_err());
+    }
+
+    #[test]
+    fn parse_headers_empty_value() {
+        let h = parse_headers_json(r#"{"Key": ""}"#).unwrap();
+        assert_eq!(h[0].1, "");
+    }
+
+    #[test]
+    fn parse_headers_with_newline_escape() {
+        let h = parse_headers_json(r#"{"Key": "line1\nline2"}"#).unwrap();
+        assert_eq!(h[0].1, "line1\nline2");
     }
 }
