@@ -1,0 +1,355 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>atua-net test harness</title>
+</head>
+<body>
+  <h1>atua-net test harness</h1>
+  <script type="module">
+    import init, { atua_fetch, atua_fetch_streaming, atua_connect, atua_stream_send, atua_stream_recv, atua_stream_close, atua_websocket, atua_ws_send, atua_ws_recv, atua_ws_close } from '../wasm-pkg/atua_net.js';
+    import { WispConnection } from '../node_modules/@mercuryworkshop/wisp-client-js/src/wisp.mjs';
+
+    // ── Wisp Client Bridge ─────────────────────────────────────
+    // Bridges event-driven WispStream API to the promise-based
+    // callbacks that the WASM module expects.
+
+    class WispBridge {
+      constructor(wispUrl) {
+        this.wispUrl = wispUrl;
+        this.conn = null;
+        this.streams = new Map();
+        this.nextId = 1;
+      }
+
+      async ensureConnected() {
+        if (this._connectPromise) return this._connectPromise;
+        if (this.conn && this.conn.connected) return;
+        this.conn = new WispConnection(this.wispUrl);
+        this._connectPromise = new Promise((resolve, reject) => {
+          this.conn.addEventListener('open', () => { this._connectPromise = null; resolve(); }, { once: true });
+          this.conn.addEventListener('error', (e) => { this._connectPromise = null; reject(new Error('Wisp connection failed')); }, { once: true });
+        });
+        return this._connectPromise;
+      }
+
+      createCallbacks() {
+        const bridge = this;
+
+        const wisp_open = async (host, port) => {
+          await bridge.ensureConnected();
+          const stream = bridge.conn.create_stream(host, port);
+          const id = String(bridge.nextId++);
+
+          // Buffer incoming data with a queue of promises
+          const dataQueue = [];
+          const waiters = [];
+          let closed = false;
+
+          stream.addEventListener('message', (event) => {
+            const data = event.data instanceof Uint8Array
+              ? event.data
+              : new Uint8Array(event.data);
+            if (waiters.length > 0) {
+              waiters.shift()(data);
+            } else {
+              dataQueue.push(data);
+            }
+          });
+
+          stream.addEventListener('close', () => {
+            closed = true;
+            // Resolve any waiting recv() with empty data to signal close
+            while (waiters.length > 0) {
+              waiters.shift()(new Uint8Array(0));
+            }
+          });
+
+          bridge.streams.set(id, {
+            stream,
+            dataQueue,
+            waiters,
+            get closed() { return closed; },
+          });
+
+          return id;
+        };
+
+        const wisp_send = async (streamId, data) => {
+          const entry = bridge.streams.get(streamId);
+          if (!entry) throw new Error(`stream ${streamId} not found`);
+          const arr = data instanceof Uint8Array ? data : new Uint8Array(data);
+          entry.stream.send(arr);
+        };
+
+        const wisp_recv = async (streamId) => {
+          const entry = bridge.streams.get(streamId);
+          if (!entry) throw new Error(`stream ${streamId} not found`);
+
+          if (entry.dataQueue.length > 0) {
+            return entry.dataQueue.shift();
+          }
+
+          if (entry.closed) {
+            return new Uint8Array(0);
+          }
+
+          return new Promise((resolve) => {
+            entry.waiters.push(resolve);
+          });
+        };
+
+        const wisp_close = async (streamId) => {
+          const entry = bridge.streams.get(streamId);
+          if (entry) {
+            try { entry.stream.close(); } catch (_) {}
+            bridge.streams.delete(streamId);
+          }
+        };
+
+        return { wisp_open, wisp_send, wisp_recv, wisp_close };
+      }
+
+      close() {
+        for (const [id, entry] of this.streams) {
+          try { entry.stream.close(); } catch (_) {}
+        }
+        this.streams.clear();
+        this.conn = null;
+      }
+    }
+
+    // ── Query Param: native Wisp path ──────────────────────────
+    const _params = new URLSearchParams(location.search);
+    const _useNativeWisp = _params.get('native') === 'true';
+    const _wispUrl = 'ws://localhost:3457/';
+    if (_useNativeWisp) console.log('[test] Using NATIVE Rust Wisp path');
+
+    // ── Global test API ────────────────────────────────────────
+
+    window.__atuaNet = { init, atua_fetch, atua_connect, atua_stream_send, atua_stream_recv, atua_stream_close };
+    window.__atuaNetReady = false;
+    window.__atuaNetNative = _useNativeWisp;
+    window.__WispBridge = WispBridge;
+
+    // ── Shared WispBridge (one WebSocket for all requests) ──────
+    let sharedBridges = new Map();
+    function getSharedBridge(wispUrl = 'ws://localhost:3457/') {
+      if (!sharedBridges.has(wispUrl)) {
+        sharedBridges.set(wispUrl, new WispBridge(wispUrl));
+      }
+      return sharedBridges.get(wispUrl);
+    }
+
+    // ── Circuit Breaker (per-host) ──────────────────────────────
+    const circuitBreakers = new Map();
+    function getCircuit(host) {
+      if (!circuitBreakers.has(host)) {
+        circuitBreakers.set(host, { failures: 0, lastFailure: 0, open: false });
+      }
+      return circuitBreakers.get(host);
+    }
+
+    // Helper function for tests: do a full fetch with Wisp wiring
+    window.__atuaFetch = async (url, options = {}, wispUrl = 'ws://localhost:3457/') => {
+      // Circuit breaker check
+      try {
+        const hostMatch = url.match(/https:\/\/([^/:]+)/);
+        const host = hostMatch ? hostMatch[1] : '';
+        const cb_state = getCircuit(host);
+        if (cb_state.open) {
+          const cooldown = 30000; // 30s
+          if (Date.now() - cb_state.lastFailure < cooldown) {
+            throw new Error(`circuit open for ${host}`);
+          }
+          cb_state.open = false; // cooldown passed, try again
+        }
+      } catch (e) {
+        if (e.message.startsWith('circuit open')) throw e;
+      }
+
+      const retry = options.retry || { maxAttempts: 1 };
+      const maxAttempts = retry.maxAttempts || 1;
+      const backoffBase = retry.backoffBaseMs || 1000;
+      const retryStatuses = retry.retryOnStatus || [429, 502, 503, 504];
+
+      let lastError = null;
+      let lastResp = null;
+
+      for (let attempt = 0; attempt < maxAttempts; attempt++) {
+        if (attempt > 0) {
+          const backoff = Math.min(backoffBase * Math.pow(2, attempt - 1), 30000);
+          console.log(`[retry] attempt ${attempt + 1}/${maxAttempts} after ${backoff}ms`);
+          await new Promise(r => setTimeout(r, backoff));
+        }
+
+        const bridge = getSharedBridge(wispUrl);
+        const cb = bridge.createCallbacks();
+        try {
+          const method = options.method || 'GET';
+          const headers = JSON.stringify(options.headers || {});
+          let body = null;
+          if (options.body != null) {
+            if (typeof options.body === 'string') {
+              body = new TextEncoder().encode(options.body);
+            } else {
+              body = options.body instanceof Uint8Array ? options.body : new Uint8Array(options.body);
+            }
+          }
+          const timeoutMs = options.timeout_ms != null ? options.timeout_ms : undefined;
+          const maxRedirects = options.maxRedirects != null ? options.maxRedirects : undefined;
+          const useCookies = options.cookies === true ? true : undefined;
+          const pinsJson = options.pins ? JSON.stringify(options.pins) : undefined;
+          const customCaPem = options.customCaPem || undefined;
+          const tlsConfigJson = options.tlsConfig ? JSON.stringify(options.tlsConfig) : undefined;
+          const nativeWisp = _useNativeWisp ? true : undefined;
+          const nativeUrl = _useNativeWisp ? _wispUrl : undefined;
+          const result = await atua_fetch(url, method, headers, body,
+            _useNativeWisp ? undefined : cb.wisp_send,
+            _useNativeWisp ? undefined : cb.wisp_recv,
+            _useNativeWisp ? undefined : cb.wisp_open,
+            _useNativeWisp ? undefined : cb.wisp_close,
+            timeoutMs, maxRedirects, useCookies, pinsJson, customCaPem, tlsConfigJson,
+            nativeWisp, nativeUrl);
+          const resp = {
+            status: result.status,
+            headers: result.headers,
+            body: result.body instanceof Uint8Array ? result.body : new Uint8Array(result.body),
+            timing: result.timing || null,
+          };
+
+          // Circuit breaker: reset on success
+          try {
+            const hostMatch = url.match(/https:\/\/([^/:]+)/);
+            if (hostMatch) { const s = getCircuit(hostMatch[1]); s.failures = 0; s.open = false; }
+          } catch (_) {}
+
+          // Check if retryable status
+          if (retryStatuses.includes(resp.status) && attempt < maxAttempts - 1) {
+            lastResp = resp;
+            continue;
+          }
+
+          return resp;
+        } catch (e) {
+          // Circuit breaker: track failure
+          try {
+            const hostMatch = url.match(/https:\/\/([^/:]+)/);
+            if (hostMatch) {
+              const s = getCircuit(hostMatch[1]);
+              s.failures++;
+              s.lastFailure = Date.now();
+              if (s.failures >= 5) s.open = true;
+            }
+          } catch (_) {}
+
+          lastError = e;
+          // Don't retry on 4xx (except 429) or TLS errors
+          if (attempt < maxAttempts - 1) {
+            continue; // retry on network errors
+          }
+        } finally {
+          // shared bridge stays open for multiplexing
+        }
+      }
+
+      if (lastResp) return lastResp;
+      throw lastError || new Error('fetch failed');
+    };
+
+    // Helper: raw connect — routes through WASM for TLS encryption
+    window.__atuaConnect = async (host, port, tls = true, wispUrl = 'ws://localhost:3457/') => {
+      const bridge = getSharedBridge(wispUrl);
+      const cb = bridge.createCallbacks();
+      const handle = await atua_connect(host, port, tls,
+        _useNativeWisp ? undefined : cb.wisp_send,
+        _useNativeWisp ? undefined : cb.wisp_recv,
+        _useNativeWisp ? undefined : cb.wisp_open,
+        _useNativeWisp ? undefined : cb.wisp_close,
+        _useNativeWisp ? true : undefined,
+        _useNativeWisp ? _wispUrl : undefined);
+      const streamKey = handle.streamId;
+      return {
+        async send(data) {
+          const arr = data instanceof Uint8Array ? data : new Uint8Array(data);
+          await atua_stream_send(streamKey, arr);
+        },
+        async recv() {
+          const result = await atua_stream_recv(streamKey);
+          return result instanceof Uint8Array ? result : new Uint8Array(result);
+        },
+        close() {
+          atua_stream_close(streamKey);
+          // shared bridge stays open for multiplexing
+        },
+      };
+    };
+
+    // Helper: streaming fetch
+    window.__atuaFetchStreaming = async (url, options = {}, wispUrl = 'ws://localhost:3457/') => {
+      const bridge = getSharedBridge(wispUrl);
+      const cb = bridge.createCallbacks();
+      const method = options.method || 'GET';
+      const headers = JSON.stringify(options.headers || {});
+      let body = null;
+      if (options.body != null) {
+        body = typeof options.body === 'string'
+          ? new TextEncoder().encode(options.body)
+          : options.body instanceof Uint8Array ? options.body : new Uint8Array(options.body);
+      }
+
+      const chunks = [];
+      const onChunk = (chunk) => {
+        chunks.push(chunk instanceof Uint8Array ? chunk : new Uint8Array(chunk));
+      };
+
+      const result = await atua_fetch_streaming(
+        url, method, headers, body,
+        _useNativeWisp ? undefined : cb.wisp_send,
+        _useNativeWisp ? undefined : cb.wisp_recv,
+        _useNativeWisp ? undefined : cb.wisp_open,
+        _useNativeWisp ? undefined : cb.wisp_close,
+        onChunk, undefined, undefined,
+        _useNativeWisp ? true : undefined,
+        _useNativeWisp ? _wispUrl : undefined,
+      );
+
+      return {
+        status: result.status,
+        headers: result.headers,
+        chunks,
+      };
+    };
+
+    // Helper: WebSocket connect
+    window.__atuaWebSocket = async (url, wispUrl = 'ws://localhost:3457/') => {
+      const bridge = getSharedBridge(wispUrl);
+      const cb = bridge.createCallbacks();
+      const handle = await atua_websocket(url,
+        _useNativeWisp ? undefined : cb.wisp_send,
+        _useNativeWisp ? undefined : cb.wisp_recv,
+        _useNativeWisp ? undefined : cb.wisp_open,
+        _useNativeWisp ? undefined : cb.wisp_close,
+        _useNativeWisp ? true : undefined,
+        _useNativeWisp ? _wispUrl : undefined);
+      const key = handle.streamId;
+      return {
+        async send(msg) { await atua_ws_send(key, msg); },
+        async recv() {
+          const data = await atua_ws_recv(key);
+          return data === null ? null : data;
+        },
+        close() { atua_ws_close(key); },
+      };
+    };
+
+    init().then(() => {
+      window.__atuaNetReady = true;
+      console.log('atua-net WASM initialized');
+    }).catch(err => {
+      window.__atuaNetError = err.toString();
+      console.error('atua-net WASM init failed:', err);
+    });
+  </script>
+</body>
+</html>

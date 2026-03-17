@@ -1,0 +1,85 @@
+[package]
+name = "atua-net"
+version = "0.2.0"
+edition = "2021"
+license = "MIT"
+description = "Production browser WASM networking: HTTPS, TCP/TLS, WebSocket via Wisp relay with E2E encryption"
+
+[package.metadata.wasm-pack.profile.release]
+wasm-opt = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# TLS — audited, battle-tested
+rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
+ring = { version = "0.17", features = ["wasm32_unknown_unknown_js"] }
+rustls-pki-types = { version = "1", features = ["web"] }
+webpki-roots = "1"
+getrandom = { version = "0.2", features = ["js"] }
+
+# Async runtime — WASM-compatible subset (NO net, NO time — those need mio)
+tokio = { version = "1", default-features = false, features = ["rt", "macros", "io-util", "sync"] }
+
+# HTTP client
+hyper = { version = "1", features = ["client", "http1", "http2"] }
+
+# TLS integration with tokio — use ring, NOT aws-lc-rs (aws-lc doesn't support WASM)
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+
+# URL parsing (WHATWG compliant) — replaces hand-rolled parse_url
+url = "2"
+
+# Serialization — replaces hand-rolled JSON parser
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# HTTP types
+http = "1"
+http-body = "1"
+http-body-util = "0.1"
+bytes = "1"
+pin-project-lite = "0.2"
+
+# Cookies — RFC 6265 compliant jar
+cookie_store = { version = "0.21", features = ["wasm-bindgen"] }
+cookie = "0.18"
+
+# Compression — response decompression (pure Rust backends)
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+brotli-decompressor = { version = "4", default-features = false, features = ["std"] }
+
+# Timers — WASM-compatible (for timeouts)
+wasmtimer = "0.4"
+
+# Logging — structured, routes to browser console
+log = "0.4"
+console_log = { version = "1", features = ["color"] }
+console_error_panic_hook = "0.1"
+
+# Certificate pinning + custom CA
+x509-parser = { version = "0.16", default-features = false }
+base64 = "0.22"
+rustls-pemfile = "2"
+
+# WASM interop
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
+web-sys = { version = "0.3", features = [
+    "console",
+    "WebSocket",
+    "MessageEvent",
+    "BinaryType",
+    "ErrorEvent",
+    "CloseEvent",
+    "Event",
+] }
+
+[dev-dependencies]
+wasm-bindgen-test = "0.3"
+
+[profile.release]
+opt-level = "s"
+lto = true
