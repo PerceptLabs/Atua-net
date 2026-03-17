@@ -143,7 +143,7 @@ impl WispFrame {
 // ─── WispClient ──────────────────────────────────────────────────
 
 struct StreamState {
-    data_tx: mpsc::Sender<Result<Vec<u8>, String>>,
+    data_tx: mpsc::UnboundedSender<Result<Vec<u8>, String>>,
     buffer_remaining: u32,
     buffer_notify: Rc<tokio::sync::Notify>,
 }
@@ -198,7 +198,7 @@ impl WispClient {
                 WispFrame::Data { stream_id, payload } => {
                     let streams = streams_clone.borrow();
                     if let Some(state) = streams.get(&stream_id) {
-                        let _ = state.data_tx.try_send(Ok(payload));
+                        let _ = state.data_tx.send(Ok(payload));
                     }
                 }
                 WispFrame::Continue { stream_id: 0, buffer_remaining } => {
@@ -218,9 +218,9 @@ impl WispClient {
                     let mut streams = streams_clone.borrow_mut();
                     if let Some(state) = streams.remove(&stream_id) {
                         if reason == 0x02 {
-                            let _ = state.data_tx.try_send(Ok(vec![])); // EOF
+                            let _ = state.data_tx.send(Ok(vec![])); // EOF
                         } else {
-                            let _ = state.data_tx.try_send(Err(format!("stream closed: reason 0x{:02x}", reason)));
+                            let _ = state.data_tx.send(Err(format!("stream closed: reason 0x{:02x}", reason)));
                         }
                     }
                 }
@@ -236,7 +236,7 @@ impl WispClient {
         let onerror = Closure::<dyn FnMut(web_sys::ErrorEvent)>::new(move |_event: web_sys::ErrorEvent| {
             let mut streams = streams_err.borrow_mut();
             for (_, state) in streams.drain() {
-                let _ = state.data_tx.try_send(Err("wisp connection error".into()));
+                let _ = state.data_tx.send(Err("wisp connection error".into()));
             }
         });
         ws.set_onerror(Some(onerror.as_ref().unchecked_ref()));
@@ -246,7 +246,7 @@ impl WispClient {
         let onclose = Closure::<dyn FnMut(web_sys::CloseEvent)>::new(move |_event: web_sys::CloseEvent| {
             let mut streams = streams_close.borrow_mut();
             for (_, state) in streams.drain() {
-                let _ = state.data_tx.try_send(Ok(vec![])); // EOF
+                let _ = state.data_tx.send(Ok(vec![])); // EOF
             }
         });
         ws.set_onclose(Some(onclose.as_ref().unchecked_ref()));
@@ -280,7 +280,7 @@ impl WispClient {
         }))
     }
 
-    pub fn open_stream(&self, host: &str, port: u16) -> Result<(u32, mpsc::Receiver<Result<Vec<u8>, String>>, Rc<tokio::sync::Notify>), String> {
+    pub fn open_stream(&self, host: &str, port: u16) -> Result<(u32, mpsc::UnboundedReceiver<Result<Vec<u8>, String>>, Rc<tokio::sync::Notify>), String> {
         let stream_id = {
             let mut id = self.next_stream_id.borrow_mut();
             let sid = *id;
@@ -288,7 +288,7 @@ impl WispClient {
             sid
         };
 
-        let (data_tx, data_rx) = mpsc::channel(256);
+        let (data_tx, data_rx) = mpsc::unbounded_channel();
         let buffer_remaining = *self.initial_buffer_size.borrow();
         let buffer_notify = Rc::new(tokio::sync::Notify::new());
 

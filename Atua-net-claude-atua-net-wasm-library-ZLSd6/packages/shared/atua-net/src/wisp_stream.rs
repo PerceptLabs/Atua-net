@@ -69,8 +69,8 @@ enum WriteBackend {
 
 /// A tokio-compatible async stream — works with either JS or native Wisp backend.
 pub struct WispStream {
-    /// Receiver for data (both paths feed this via mpsc channel).
-    read_rx: mpsc::Receiver<Result<Vec<u8>, String>>,
+    /// Receiver for data (both paths feed this via unbounded mpsc channel).
+    read_rx: mpsc::UnboundedReceiver<Result<Vec<u8>, String>>,
     /// Buffered data not yet consumed by AsyncRead.
     read_buf: BytesMut,
     /// True once read channel has been closed.
@@ -90,7 +90,7 @@ impl WispStream {
         wisp_close: Function,
     ) -> Self {
         // Background recv loop
-        let (read_tx, read_rx) = mpsc::channel::<Result<Vec<u8>, String>>(64);
+        let (read_tx, read_rx) = mpsc::unbounded_channel::<Result<Vec<u8>, String>>();
         let recv_sid = stream_id.clone();
         wasm_bindgen_futures::spawn_local(async move {
             loop {
@@ -101,7 +101,7 @@ impl WispStream {
                         let mut data = vec![0u8; arr.length() as usize];
                         arr.copy_to(&mut data);
                         let is_eof = data.is_empty();
-                        if read_tx.send(Ok(data)).await.is_err() {
+                        if read_tx.send(Ok(data)).is_err() {
                             break;
                         }
                         if is_eof {
@@ -109,7 +109,7 @@ impl WispStream {
                         }
                     }
                     Err(e) => {
-                        let _ = read_tx.send(Err(e)).await;
+                        let _ = read_tx.send(Err(e));
                         break;
                     }
                 }
@@ -143,7 +143,7 @@ impl WispStream {
     /// Native Rust Wisp client path.
     pub fn from_native(
         stream_id: u32,
-        data_rx: mpsc::Receiver<Result<Vec<u8>, String>>,
+        data_rx: mpsc::UnboundedReceiver<Result<Vec<u8>, String>>,
         client: std::rc::Rc<crate::wisp::WispClient>,
         buffer_notify: std::rc::Rc<tokio::sync::Notify>,
     ) -> Self {

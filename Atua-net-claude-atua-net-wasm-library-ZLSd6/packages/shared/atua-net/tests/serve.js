@@ -1,13 +1,19 @@
 /**
- * Test server: serves static files + runs a local Wisp relay.
+ * Test server: static files + local binary endpoint + self-contained Wisp v1 relay.
  *
  * Static server: http://localhost:3456
  * Wisp relay:    ws://localhost:3457
+ *
+ * The relay implements the full Wisp v1 protocol (TCP + UDP) without wisp-js.
+ * No pause/resume on TCP sockets — Node.js handles backpressure internally.
  */
 import { createServer } from 'node:http';
 import { readFile } from 'node:fs/promises';
 import { join, extname } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { WebSocketServer } from 'ws';
+import net from 'node:net';
+import dgram from 'node:dgram';
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
 const ROOT = join(__dirname, '..');
@@ -21,12 +27,29 @@ const MIME_TYPES = {
   '.css': 'text/css',
 };
 
-// ── Static file server ─────────────────────────────────────────
+// ── Static file server + local binary endpoint ────────────────
 
 const staticServer = createServer(async (req, res) => {
-  let filePath;
   const url = req.url.split('?')[0];
 
+  // Local /bytes/:n endpoint for large transfer tests
+  const bytesMatch = url.match(/^\/bytes\/(\d+)$/);
+  if (bytesMatch) {
+    const n = parseInt(bytesMatch[1], 10);
+    if (n > 0 && n <= 10_000_000) {
+      const data = Buffer.alloc(n);
+      for (let i = 0; i < n; i++) data[i] = i & 0xff;
+      res.writeHead(200, {
+        'Content-Type': 'application/octet-stream',
+        'Content-Length': n.toString(),
+        'Access-Control-Allow-Origin': '*',
+      });
+      res.end(data);
+      return;
+    }
+  }
+
+  let filePath;
   if (url === '/' || url === '/index.html') {
     filePath = join(__dirname, 'index.html');
   } else {
@@ -37,7 +60,6 @@ const staticServer = createServer(async (req, res) => {
     const content = await readFile(filePath);
     const ext = extname(filePath);
     const mime = MIME_TYPES[ext] || 'application/octet-stream';
-
     res.writeHead(200, {
       'Content-Type': mime,
       'Access-Control-Allow-Origin': '*',
@@ -53,24 +75,189 @@ staticServer.listen(3456, () => {
   console.log('Static server on http://localhost:3456');
 });
 
-// ── Local Wisp relay ───────────────────────────────────────────
+// ── Wisp v1 Relay (self-contained) ──────────────────────────────
 
-try {
-  const { server: wisp } = await import('@mercuryworkshop/wisp-js/server');
+const BUFFER_SIZE = 128;
+const CONTINUE_INTERVAL = 64;
 
-  const wispServer = createServer((req, res) => {
-    res.writeHead(200, { 'Content-Type': 'text/plain' });
-    res.end('Wisp relay');
-  });
-
-  wispServer.on('upgrade', (req, socket, head) => {
-    wisp.routeRequest(req, socket, head);
-  });
-
-  wispServer.listen(3457, () => {
-    console.log('Wisp relay on ws://localhost:3457/');
-  });
-} catch (e) {
-  console.error('Failed to start Wisp relay:', e.message);
-  console.error('Integration tests will not work without the relay.');
+function encodeFrame(type, streamId, payload) {
+  const buf = Buffer.alloc(5 + payload.length);
+  buf[0] = type;
+  buf.writeUInt32LE(streamId, 1);
+  payload.copy(buf, 5);
+  return buf;
 }
+
+function encodeClose(streamId, reason) {
+  return encodeFrame(0x04, streamId, Buffer.from([reason]));
+}
+
+function encodeContinue(streamId, bufferRemaining) {
+  const payload = Buffer.alloc(4);
+  payload.writeUInt32LE(bufferRemaining, 0);
+  return encodeFrame(0x03, streamId, payload);
+}
+
+function encodeData(streamId, data) {
+  return encodeFrame(0x02, streamId, data);
+}
+
+function parseFrame(buf) {
+  if (buf.length < 5) return null;
+  const type = buf[0];
+  const streamId = buf.readUInt32LE(1);
+  const payload = buf.subarray(5);
+  return { type, streamId, payload };
+}
+
+function mapErrorToCloseReason(code) {
+  switch (code) {
+    case 'ENOTFOUND': return 0x41;
+    case 'ECONNREFUSED': return 0x42;
+    case 'ETIMEDOUT': return 0x43;
+    case 'EADDRNOTAVAIL': return 0x44;
+    case 'ECONNRESET': return 0x47;
+    default: return 0x03;
+  }
+}
+
+function handleConnection(ws) {
+  const streams = new Map(); // streamId → { socket, type: 'tcp'|'udp', framesSent }
+
+  // Send initial CONTINUE (stream_id=0, buffer_remaining=BUFFER_SIZE)
+  ws.send(encodeContinue(0, BUFFER_SIZE));
+
+  ws.on('message', (data) => {
+    const buf = Buffer.from(data);
+    const frame = parseFrame(buf);
+    if (!frame) return;
+
+    switch (frame.type) {
+      case 0x01: { // CONNECT
+        if (frame.payload.length < 3) return;
+        const streamType = frame.payload[0];
+        const port = frame.payload.readUInt16LE(1);
+        const hostname = frame.payload.subarray(3).toString('utf-8').trim();
+
+        if (streamType === 0x01) {
+          // TCP
+          const socket = net.createConnection({ port, host: hostname, family: 4 });
+          const entry = { socket, type: 'tcp', framesSent: 0 };
+          streams.set(frame.streamId, entry);
+
+          socket.on('data', (chunk) => {
+            if (ws.readyState !== 1) return; // WebSocket.OPEN
+            ws.send(encodeData(frame.streamId, chunk));
+            entry.framesSent++;
+            if (entry.framesSent % CONTINUE_INTERVAL === 0) {
+              ws.send(encodeContinue(frame.streamId, BUFFER_SIZE));
+            }
+          });
+
+          socket.on('end', () => {
+            if (ws.readyState === 1) {
+              ws.send(encodeClose(frame.streamId, 0x02));
+            }
+            streams.delete(frame.streamId);
+          });
+
+          socket.on('close', () => {
+            streams.delete(frame.streamId);
+          });
+
+          socket.on('error', (err) => {
+            const reason = mapErrorToCloseReason(err.code);
+            if (ws.readyState === 1) {
+              ws.send(encodeClose(frame.streamId, reason));
+            }
+            streams.delete(frame.streamId);
+          });
+        } else if (streamType === 0x02) {
+          // UDP
+          const socket = dgram.createSocket('udp4');
+          const entry = { socket, type: 'udp', framesSent: 0 };
+          streams.set(frame.streamId, entry);
+
+          socket.on('message', (msg) => {
+            if (ws.readyState !== 1) return;
+            ws.send(encodeData(frame.streamId, msg));
+            entry.framesSent++;
+            if (entry.framesSent % CONTINUE_INTERVAL === 0) {
+              ws.send(encodeContinue(frame.streamId, BUFFER_SIZE));
+            }
+          });
+
+          socket.on('error', (err) => {
+            const reason = mapErrorToCloseReason(err.code);
+            if (ws.readyState === 1) {
+              ws.send(encodeClose(frame.streamId, reason));
+            }
+            streams.delete(frame.streamId);
+          });
+
+          socket.bind(() => {
+            socket.connect(port, hostname);
+          });
+        }
+        break;
+      }
+
+      case 0x02: { // DATA
+        const entry = streams.get(frame.streamId);
+        if (!entry) return;
+        if (entry.type === 'tcp') {
+          entry.socket.write(frame.payload);
+        } else {
+          entry.socket.send(frame.payload);
+        }
+        break;
+      }
+
+      case 0x04: { // CLOSE
+        const entry = streams.get(frame.streamId);
+        if (!entry) return;
+        if (entry.type === 'tcp') {
+          entry.socket.destroy();
+        } else {
+          entry.socket.close();
+        }
+        streams.delete(frame.streamId);
+        break;
+      }
+    }
+  });
+
+  ws.on('close', () => {
+    for (const [, entry] of streams) {
+      if (entry.type === 'tcp') {
+        entry.socket.destroy();
+      } else {
+        try { entry.socket.close(); } catch (_) {}
+      }
+    }
+    streams.clear();
+  });
+
+  ws.on('error', () => {
+    for (const [, entry] of streams) {
+      if (entry.type === 'tcp') {
+        entry.socket.destroy();
+      } else {
+        try { entry.socket.close(); } catch (_) {}
+      }
+    }
+    streams.clear();
+  });
+}
+
+const wispServer = createServer((req, res) => {
+  res.writeHead(200, { 'Content-Type': 'text/plain' });
+  res.end('Wisp relay');
+});
+
+const wss = new WebSocketServer({ server: wispServer });
+wss.on('connection', handleConnection);
+
+wispServer.listen(3457, () => {
+  console.log('Wisp v1 relay on ws://localhost:3457/');
+});

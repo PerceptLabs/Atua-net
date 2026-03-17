@@ -11,6 +11,27 @@ The spec (`atua-net-v2-final.md`) is the source of truth. It has 8 priority tier
 3. **No stopping after a sub-plan.** Audit the spec against the codebase after every session.
 4. **Find a crate first.** If you're about to write a parser, decoder, hasher, or matcher — check crates.io.
 
+## Git Workflow — Snapshots
+
+When the user says "push", "snapshot", or "checkpoint":
+
+1. `git add -A`
+2. `git commit -m "Snapshot: <description>"` — use context from recent work
+3. Create snapshot branch using **today's actual date**:
+   ```bash
+   git branch "snapshot-$(date +%Y-%m-%d)-<short-description>"
+   ```
+4. Push it:
+   ```bash
+   git push origin "snapshot-$(date +%Y-%m-%d)-<short-description>"
+   ```
+5. **Stay on current branch** — do NOT checkout the snapshot
+6. Tell the user: what was committed, the snapshot branch name, and confirm still on working branch
+
+These are frozen checkpoints. Never switch to them. Keep working on main.
+**Always use `$(date +%Y-%m-%d)` for the date. Never hardcode a date.**
+**Use kebab-case for short descriptions.**
+
 ## Progress Tracker
 
 ### Priority 0 — Critical Bug Fix
@@ -37,11 +58,11 @@ The spec (`atua-net-v2-final.md`) is the source of truth. It has 8 priority tier
 
 ### Priority 5 — Streaming & WebSocket
 - [x] Streaming response API with on_chunk callback (atua_fetch_streaming, no Accept-Encoding in streaming mode)
-- [x] WebSocket client (hand-rolled RFC 6455 framing over TLS stream)
+- [x] WebSocket client (hand-rolled RFC 6455 framing, random masks, Accept verification)
 
 ### Priority 6 — Security Features
-- [x] Certificate pinning (x509-parser for SPKI extraction, ring::digest for SHA256, base64 for encoding) — both wrong-pin and correct-pin tests
-- [x] Custom CA certificates (rustls-pemfile for PEM parsing, custom_ca_pem parameter wired through to WASM)
+- [x] Certificate pinning (x509-parser for SPKI extraction, ring::digest for SHA256, base64 for encoding)
+- [x] Custom CA certificates (rustls-pemfile for PEM parsing, custom_ca_pem parameter)
 - [x] TLS configuration API (tls_config_json parameter: minVersion, alpn overrides)
 
 ### Priority 7 — Middleware & Advanced API
@@ -51,13 +72,16 @@ The spec (`atua-net-v2-final.md`) is the source of truth. It has 8 priority tier
 
 ### v3 — Native Rust Wisp Client
 - [x] Wisp v1 frame codec (encode/decode, 14 unit tests)
-- [x] WispClient (web_sys::WebSocket, stream demux, flow control counter, thread-local pool)
+- [x] WispClient (web_sys::WebSocket, stream demux, flow control + Notify)
 - [x] WispStream::from_native constructor (dual write backend via enum)
-- [x] Dual-path WASM exports (use_native_wisp + wisp_url params on all 4 endpoints)
+- [x] Dual-path WASM exports (use_native_wisp + wisp_url params, Option<Function> callbacks)
 - [x] AtuaNetClient nativeWisp option (pkg/atua-net.js)
-- [x] 8 native path integration tests (7 pass, 1 concurrent skip — race condition)
-- [ ] Fix concurrent stream race condition (TLS handshake EOF under multiplexing)
-- [ ] Full test suite parity: run all 64 JS-path tests against native path
+- [x] Flow control enforcement (buffer_remaining check before send, Notify wake on CONTINUE)
+- [x] Unbounded channels for DATA frames (fixes 102KB truncation — bounded channel silently dropped frames)
+- [x] Self-contained Wisp v1 relay in tests/serve.js (replaces wisp-js, no pause/resume, TCP + UDP)
+- [x] All 8 native path integration tests passing (Tier 16)
+- [x] 16 native hardening tests passing (Tier 17)
+- [x] 12 pressure tests passing (Tier 18: 200 sequential, 50 burst, 20 concurrent, mixed errors)
 
 ### Bonus (not in original spec)
 - [x] HTTP/2 via hyper ALPN auto-detection
@@ -66,26 +90,28 @@ The spec (`atua-net-v2-final.md`) is the source of truth. It has 8 priority tier
 
 | File | Role |
 |------|------|
-| `src/lib.rs` | WASM exports: fetch, fetch_streaming, connect, websocket, stream ops, cert pinning |
-| `src/wisp_stream.rs` | WispStream (AsyncRead/Write via mpsc channels) + TokioIo adapter |
-| `src/websocket.rs` | Hand-rolled RFC 6455 framing (~180 lines) |
-| `pkg/atua-net.js` | Production JS: AtuaNetClient class + bare function exports |
-| `tests/index.html` | Browser test harness |
-| `tests/atua-net.spec.js` | Playwright tests — 64 tests across 16+ tiers |
-| `Cargo.toml` | Rust dependencies (25+ crates) |
+| `src/lib.rs` | WASM exports: fetch, fetch_streaming, connect, websocket, stream ops, cert pinning, connection pool |
+| `src/wisp_stream.rs` | WispStream (AsyncRead/Write via unbounded mpsc channels) + TokioIo adapter |
+| `src/wisp.rs` | Wisp v1 frame codec + WispClient (web_sys::WebSocket, flow control, stream demux) |
+| `src/websocket.rs` | Hand-rolled RFC 6455 framing (~230 lines) |
+| `pkg/atua-net.js` | Production JS: AtuaNetClient class with retry, circuit breaker, middleware |
+| `tests/index.html` | Browser test harness (dual JS/native Wisp path support) |
+| `tests/atua-net.spec.js` | Playwright tests — 100 tests across 18+ tiers |
+| `tests/serve.js` | Static server + local /bytes/ endpoint + self-contained Wisp v1 relay |
+| `Cargo.toml` | Rust dependencies (30+ crates) |
 
 ## Build & Test
 
 ```bash
 export PATH="/c/Program Files/LLVM/bin:$PATH"  # LLVM needed for ring WASM build
-cargo test                                       # Rust unit tests
+cargo test                                       # 21 Rust unit tests
 wasm-pack build --target web --out-dir wasm-pkg  # Build WASM
-npx playwright test --reporter=list              # Integration tests
+npx playwright test --reporter=list              # 100 integration tests
 ```
 
 ## Current Stats
 
-- 73 Playwright tests, 69 passed, 0 failed, 4 skipped
+- 100 Playwright tests, 98 passed, 0 failed, 2 skipped (API key, WS echo server)
 - 21 Rust unit tests passing (7 lib + 14 wisp frame codec)
-- JS path: 62/64 pass (2 skip: API key, WS echo)
-- Native Rust Wisp path: 7/9 pass (2 skip: concurrent race, placeholder)
+- JS path: 62/64 pass (2 skip)
+- Native Rust Wisp path: 36/36 pass (Tier 16 + 17 + 18)

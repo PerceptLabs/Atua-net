@@ -195,8 +195,7 @@ test.describe('Tier 2 — Chunked Transfer & Streaming', () => {
       return { status: resp.status, bodyLength: resp.body.length };
     });
     expect(result.status).toBe(200);
-    // The relay may truncate very large responses — verify we got a substantial portion
-    // Full 1MB delivery depends on relay TCP handling; hyper rewrite (Phase A') will improve this
+    // Large transfers may truncate — relay or httpbin limitation under investigation
     expect(result.bodyLength).toBeGreaterThanOrEqual(100_000);
   });
 });
@@ -618,7 +617,6 @@ test.describe('Tier 7 — WASM Edge Cases', () => {
       return { status: resp.status, bodyLength: resp.body.length };
     });
     expect(result.status).toBe(200);
-    // Relay may truncate very large responses — verify substantial data received
     expect(result.bodyLength).toBeGreaterThanOrEqual(100_000);
   });
 
@@ -1302,6 +1300,495 @@ test.describe('Tier 16 — Native Wisp Path', () => {
       return { status: resp.status };
     });
     expect(result.status).toBe(200);
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════
+// Tier 17 — Native Wisp Hardening
+// ═══════════════════════════════════════════════════════════════
+
+test.describe('Tier 17 — Native Wisp Hardening', () => {
+  // ── Error recovery & stream isolation ──────────────────────
+
+  test('17.1: Error then immediate success', async ({ page }) => {
+    test.setTimeout(30_000);
+    await waitForWasmNative(page);
+    const result = await page.evaluate(async () => {
+      try { await window.__atuaFetch('https://expired.badssl.com/'); } catch (_) {}
+      const resp = await window.__atuaFetch('https://httpbin.org/get');
+      return { status: resp.status };
+    });
+    expect(result.status).toBe(200);
+  });
+
+  test('17.2: Mixed concurrent — good requests survive bad ones', async ({ page }) => {
+    test.setTimeout(30_000);
+    await waitForWasmNative(page);
+    const result = await page.evaluate(async () => {
+      const promises = [
+        window.__atuaFetch('https://httpbin.org/get').then(r => ({ ok: true, status: r.status })).catch(() => ({ ok: false })),
+        window.__atuaFetch('https://expired.badssl.com/').then(r => ({ ok: true })).catch(() => ({ ok: false })),
+        window.__atuaFetch('https://httpbin.org/ip').then(r => ({ ok: true, status: r.status })).catch(() => ({ ok: false })),
+        window.__atuaFetch('https://self-signed.badssl.com/').then(r => ({ ok: true })).catch(() => ({ ok: false })),
+        window.__atuaFetch('https://httpbin.org/headers').then(r => ({ ok: true, status: r.status })).catch(() => ({ ok: false })),
+      ];
+      const results = await Promise.all(promises);
+      return {
+        successes: results.filter(r => r.ok).length,
+        failures: results.filter(r => !r.ok).length,
+      };
+    });
+    expect(result.successes).toBe(3);
+    expect(result.failures).toBe(2);
+  });
+
+  test('17.3: Three consecutive errors then success', async ({ page }) => {
+    test.setTimeout(30_000);
+    await waitForWasmNative(page);
+    const result = await page.evaluate(async () => {
+      for (let i = 0; i < 3; i++) {
+        try { await window.__atuaFetch('https://expired.badssl.com/'); } catch (_) {}
+      }
+      const resp = await window.__atuaFetch('https://httpbin.org/get');
+      return { status: resp.status };
+    });
+    expect(result.status).toBe(200);
+  });
+
+  test('17.4: Alternating error/success under load', async ({ page }) => {
+    test.setTimeout(60_000);
+    await waitForWasmNative(page);
+    const result = await page.evaluate(async () => {
+      let errors = 0, successes = 0;
+      for (let i = 0; i < 10; i++) {
+        try {
+          if (i % 2 === 0) {
+            await window.__atuaFetch('https://expired.badssl.com/');
+          } else {
+            const resp = await window.__atuaFetch('https://httpbin.org/get');
+            if (resp.status === 200) successes++;
+          }
+        } catch (_) {
+          errors++;
+        }
+      }
+      return { errors, successes };
+    });
+    expect(result.errors).toBe(5);
+    expect(result.successes).toBe(5);
+  });
+
+  // ── Sustained load (agentic-scale) ────────────────────────
+
+  test('17.5: 10 concurrent requests', async ({ page }) => {
+    test.setTimeout(30_000);
+    await waitForWasmNative(page);
+    const result = await page.evaluate(async () => {
+      const urls = Array.from({ length: 10 }, (_, i) => `https://httpbin.org/get?n=${i}`);
+      const results = await Promise.all(urls.map(u => window.__atuaFetch(u)));
+      return { allOk: results.every(r => r.status === 200), count: results.length };
+    });
+    expect(result.allOk).toBe(true);
+    expect(result.count).toBe(10);
+  });
+
+  test('17.6: 5MB binary download', async ({ page }) => {
+    test.setTimeout(60_000);
+    await waitForWasmNative(page);
+    const result = await page.evaluate(async () => {
+      const resp = await window.__atuaFetch('https://httpbin.org/bytes/5000000');
+      return { status: resp.status, bodyLength: resp.body.length };
+    });
+    expect(result.status).toBe(200);
+    expect(result.bodyLength).toBeGreaterThanOrEqual(100_000);
+  });
+
+  test('17.7: 100 sequential requests — no stream leak', async ({ page }) => {
+    test.setTimeout(600_000);
+    await waitForWasmNative(page);
+    const result = await page.evaluate(async () => {
+      for (let i = 0; i < 100; i++) {
+        const resp = await window.__atuaFetch('https://httpbin.org/get');
+        if (resp.status !== 200) return { ok: false, failedAt: i };
+      }
+      return { ok: true };
+    });
+    expect(result.ok).toBe(true);
+  });
+
+  test('17.8: Rapid open/close — 50 streams, no leak', async ({ page }) => {
+    test.setTimeout(120_000);
+    await waitForWasmNative(page);
+    const result = await page.evaluate(async () => {
+      for (let i = 0; i < 50; i++) {
+        const stream = await window.__atuaConnect('httpbin.org', 443, true);
+        stream.close();
+      }
+      const resp = await window.__atuaFetch('https://httpbin.org/get');
+      return { status: resp.status };
+    });
+    expect(result.status).toBe(200);
+  });
+
+  test('17.9: Large POST body — 100KB', async ({ page }) => {
+    test.setTimeout(30_000);
+    await waitForWasmNative(page);
+    const result = await page.evaluate(async () => {
+      const body = JSON.stringify({ data: 'X'.repeat(100_000) });
+      const resp = await window.__atuaFetch('https://httpbin.org/post', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body,
+      });
+      const json = JSON.parse(new TextDecoder().decode(resp.body));
+      return { status: resp.status, dataLength: json.json?.data?.length };
+    });
+    expect(result.status).toBe(200);
+    expect(result.dataLength).toBe(100_000);
+  });
+
+  test('17.10: Sustained streaming — 50 chunks', async ({ page }) => {
+    test.setTimeout(60_000);
+    await waitForWasmNative(page);
+    const result = await page.evaluate(async () => {
+      const resp = await window.__atuaFetchStreaming('https://httpbin.org/stream/50');
+      const allText = resp.chunks.map(c => new TextDecoder().decode(c)).join('');
+      const lines = allText.trim().split('\n').filter(l => l.length > 0);
+      return { chunkCount: resp.chunks.length, lineCount: lines.length };
+    });
+    expect(result.lineCount).toBe(50);
+    expect(result.chunkCount).toBeGreaterThan(1);
+  });
+
+  // ── Feature interactions on native path ────────────────────
+
+  test('17.11: Timeout + recovery', async ({ page }) => {
+    test.setTimeout(30_000);
+    await waitForWasmNative(page);
+    const result = await page.evaluate(async () => {
+      const start = Date.now();
+      let threw = false;
+      try {
+        await window.__atuaFetch('https://httpbin.org/delay/30', { timeout_ms: 3000 });
+      } catch (e) {
+        threw = e.toString().includes('timeout');
+      }
+      const elapsed = Date.now() - start;
+      const resp = await window.__atuaFetch('https://httpbin.org/get');
+      return { threw, elapsed, status: resp.status };
+    });
+    expect(result.threw).toBe(true);
+    expect(result.elapsed).toBeLessThan(8000);
+    expect(result.status).toBe(200);
+  });
+
+  test('17.12: Connection pooling — TLS reuse', async ({ page }) => {
+    test.setTimeout(60_000);
+    await waitForWasmNative(page);
+    const result = await page.evaluate(async () => {
+      const timings = [];
+      for (let i = 0; i < 5; i++) {
+        const resp = await window.__atuaFetch('https://httpbin.org/get');
+        timings.push(resp.timing);
+      }
+      return { firstTls: timings[0]?.tlsHandshakeMs, secondTls: timings[1]?.tlsHandshakeMs };
+    });
+    expect(result.firstTls).toBeGreaterThan(0);
+    expect(result.secondTls).toBeLessThan(5);
+  });
+
+  test('17.13: Cookies via native', async ({ page }) => {
+    test.setTimeout(30_000);
+    await waitForWasmNative(page);
+    const result = await page.evaluate(async () => {
+      await window.__atuaFetch('https://httpbin.org/cookies/set?ntest=nvalue', { cookies: true });
+      const resp = await window.__atuaFetch('https://httpbin.org/cookies', { cookies: true });
+      const json = JSON.parse(new TextDecoder().decode(resp.body));
+      return { cookies: json.cookies };
+    });
+    expect(result.cookies?.ntest).toBe('nvalue');
+  });
+
+  test('17.14: Decompression via native', async ({ page }) => {
+    test.setTimeout(30_000);
+    await waitForWasmNative(page);
+    const result = await page.evaluate(async () => {
+      const resp = await window.__atuaFetch('https://httpbin.org/gzip');
+      const json = JSON.parse(new TextDecoder().decode(resp.body));
+      return { gzipped: json.gzipped };
+    });
+    expect(result.gzipped).toBe(true);
+  });
+
+  test('17.15: Concurrent different hosts + large binary + error — all at once', async ({ page }) => {
+    test.setTimeout(60_000);
+    await waitForWasmNative(page);
+    const result = await page.evaluate(async () => {
+      const promises = [
+        window.__atuaFetch('https://httpbin.org/bytes/1000000')
+          .then(r => ({ ok: true, type: 'binary', bodyLen: r.body.length }))
+          .catch(() => ({ ok: false, type: 'binary' })),
+        window.__atuaFetch('https://httpbin.org/get')
+          .then(r => ({ ok: true, type: 'get', status: r.status }))
+          .catch(() => ({ ok: false, type: 'get' })),
+        window.__atuaFetch('https://httpbin.org/post', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ data: 'Y'.repeat(10_000) }),
+        })
+          .then(r => ({ ok: true, type: 'post', status: r.status }))
+          .catch(() => ({ ok: false, type: 'post' })),
+        window.__atuaFetch('https://expired.badssl.com/')
+          .then(() => ({ ok: true, type: 'tls' }))
+          .catch(() => ({ ok: false, type: 'tls' })),
+      ];
+      const results = await Promise.all(promises);
+      return {
+        successes: results.filter(r => r.ok).length,
+        failures: results.filter(r => !r.ok).length,
+        binaryOk: results.find(r => r.type === 'binary')?.ok,
+        binaryLen: results.find(r => r.type === 'binary')?.bodyLen,
+        getOk: results.find(r => r.type === 'get')?.ok,
+        postOk: results.find(r => r.type === 'post')?.ok,
+        tlsFailed: !results.find(r => r.type === 'tls')?.ok,
+      };
+    });
+    expect(result.successes).toBe(3);
+    expect(result.failures).toBe(1);
+    expect(result.binaryOk).toBe(true);
+    expect(result.binaryLen).toBeGreaterThanOrEqual(100_000);
+    expect(result.getOk).toBe(true);
+    expect(result.postOk).toBe(true);
+    expect(result.tlsFailed).toBe(true);
+  });
+
+  test('17.16: Local /bytes/ endpoint baseline (native fetch, not Wisp)', async ({ page }) => {
+    test.setTimeout(15_000);
+    await page.goto('http://localhost:3456/');
+    const result = await page.evaluate(async () => {
+      const resp = await fetch('http://localhost:3456/bytes/5000000');
+      const buf = await resp.arrayBuffer();
+      return { status: resp.status, bodyLength: buf.byteLength };
+    });
+    expect(result.status).toBe(200);
+    expect(result.bodyLength).toBe(5_000_000);
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════
+// Tier 18 — Pressure Tests
+// ═══════════════════════════════════════════════════════════════
+
+test.describe('Tier 18 — Pressure Tests', () => {
+  // ── Large transfers ────────────────────────────────────────
+
+  test('18.1: 100KB exact via native (httpbin cap)', async ({ page }) => {
+    test.setTimeout(120_000);
+    await waitForWasmNative(page);
+    const result = await page.evaluate(async () => {
+      const resp = await window.__atuaFetch('https://httpbin.org/bytes/5000000');
+      return { status: resp.status, bodyLength: resp.body.length };
+    });
+    expect(result.status).toBe(200);
+    // httpbin.org caps /bytes/ at 102400 — verify we get the full cap, not truncated
+    expect(result.bodyLength).toBe(102_400);
+  });
+
+  test('18.2: 100KB exact via JS path (httpbin cap)', async ({ page }) => {
+    test.setTimeout(120_000);
+    await waitForWasm(page);
+    const result = await page.evaluate(async () => {
+      const resp = await window.__atuaFetch('https://httpbin.org/bytes/5000000');
+      return { status: resp.status, bodyLength: resp.body.length };
+    });
+    expect(result.status).toBe(200);
+    expect(result.bodyLength).toBe(102_400);
+  });
+
+  test('18.3: Large POST 200KB body', async ({ page }) => {
+    test.setTimeout(60_000);
+    await waitForWasmNative(page);
+    const result = await page.evaluate(async () => {
+      const body = JSON.stringify({ data: 'X'.repeat(200_000) });
+      const resp = await window.__atuaFetch('https://httpbin.org/post', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body,
+      });
+      const json = JSON.parse(new TextDecoder().decode(resp.body));
+      return { status: resp.status, dataLength: json.json?.data?.length };
+    });
+    expect(result.status).toBe(200);
+    expect(result.dataLength).toBe(200_000);
+  });
+
+  // ── Sustained concurrent load ──────────────────────────────
+
+  test('18.4: 20 concurrent requests', async ({ page }) => {
+    test.setTimeout(120_000);
+    await waitForWasmNative(page);
+    const result = await page.evaluate(async () => {
+      const promises = Array.from({ length: 20 }, (_, i) =>
+        window.__atuaFetch(`https://httpbin.org/get?n=${i}`),
+      );
+      const results = await Promise.all(promises);
+      return {
+        allOk: results.every(r => r.status === 200),
+        count: results.length,
+      };
+    });
+    expect(result.allOk).toBe(true);
+    expect(result.count).toBe(20);
+  });
+
+  test('18.5: 5 concurrent × 100KB each', async ({ page }) => {
+    test.setTimeout(180_000);
+    await waitForWasmNative(page);
+    const result = await page.evaluate(async () => {
+      const promises = Array.from({ length: 5 }, () =>
+        window.__atuaFetch('https://httpbin.org/bytes/1000000'),
+      );
+      const results = await Promise.all(promises);
+      return {
+        allOk: results.every(r => r.status === 200),
+        sizes: results.map(r => r.body.length),
+      };
+    });
+    expect(result.allOk).toBe(true);
+    // httpbin caps at 102400 — all 5 should get the full cap
+    expect(result.sizes.every(s => s === 102_400)).toBe(true);
+  });
+
+  test('18.6: Thundering herd — 50 requests burst', async ({ page }) => {
+    test.setTimeout(300_000);
+    await waitForWasmNative(page);
+    const result = await page.evaluate(async () => {
+      const promises = Array.from({ length: 50 }, (_, i) =>
+        window.__atuaFetch(`https://httpbin.org/get?burst=${i}`)
+          .then(r => ({ ok: r.status === 200 }))
+          .catch(() => ({ ok: false })),
+      );
+      const results = await Promise.all(promises);
+      return { successes: results.filter(r => r.ok).length };
+    });
+    // At least 30 of 50 should succeed (httpbin may rate limit some)
+    expect(result.successes).toBeGreaterThanOrEqual(30);
+  });
+
+  // ── Long-lived connection durability ───────────────────────
+
+  test('18.7: 200 sequential requests — sustained session', async ({ page }) => {
+    test.setTimeout(600_000);
+    await waitForWasmNative(page);
+    const result = await page.evaluate(async () => {
+      for (let i = 0; i < 200; i++) {
+        const resp = await window.__atuaFetch('https://httpbin.org/get');
+        if (resp.status !== 200) return { ok: false, failedAt: i };
+      }
+      return { ok: true };
+    });
+    expect(result.ok).toBe(true);
+  });
+
+  test('18.8: Sequential mixed sizes', async ({ page }) => {
+    test.setTimeout(300_000);
+    await waitForWasmNative(page);
+    const result = await page.evaluate(async () => {
+      const results = [];
+      for (let i = 0; i < 20; i++) {
+        if (i % 2 === 0) {
+          const resp = await window.__atuaFetch('https://httpbin.org/get');
+          results.push({ ok: resp.status === 200, type: 'small' });
+        } else {
+          const resp = await window.__atuaFetch('https://httpbin.org/bytes/500000');
+          results.push({ ok: resp.status === 200, type: 'large', size: resp.body.length });
+        }
+      }
+      return {
+        allOk: results.every(r => r.ok),
+        largeAllCorrect: results.filter(r => r.type === 'large').every(r => r.size === 102_400),
+      };
+    });
+    expect(result.allOk).toBe(true);
+    expect(result.largeAllCorrect).toBe(true);
+  });
+
+  test('18.9: Streaming then regular then streaming', async ({ page }) => {
+    test.setTimeout(60_000);
+    await waitForWasmNative(page);
+    const result = await page.evaluate(async () => {
+      const s1 = await window.__atuaFetchStreaming('https://httpbin.org/stream/20');
+      const r = await window.__atuaFetch('https://httpbin.org/get');
+      const s2 = await window.__atuaFetchStreaming('https://httpbin.org/stream/20');
+      const lines1 = s1.chunks.map(c => new TextDecoder().decode(c)).join('').trim().split('\n').filter(l => l);
+      const lines2 = s2.chunks.map(c => new TextDecoder().decode(c)).join('').trim().split('\n').filter(l => l);
+      return { lines1: lines1.length, status: r.status, lines2: lines2.length };
+    });
+    expect(result.lines1).toBe(20);
+    expect(result.status).toBe(200);
+    expect(result.lines2).toBe(20);
+  });
+
+  // ── Error resilience under pressure ────────────────────────
+
+  test('18.10: 10 TLS failures then 10 successes', async ({ page }) => {
+    test.setTimeout(120_000);
+    await waitForWasmNative(page);
+    const result = await page.evaluate(async () => {
+      for (let i = 0; i < 10; i++) {
+        try { await window.__atuaFetch('https://expired.badssl.com/'); } catch (_) {}
+      }
+      let successes = 0;
+      for (let i = 0; i < 10; i++) {
+        const resp = await window.__atuaFetch('https://httpbin.org/get');
+        if (resp.status === 200) successes++;
+      }
+      return { successes };
+    });
+    expect(result.successes).toBe(10);
+  });
+
+  test('18.11: Large transfer after error burst', async ({ page }) => {
+    test.setTimeout(120_000);
+    await waitForWasmNative(page);
+    const result = await page.evaluate(async () => {
+      for (let i = 0; i < 5; i++) {
+        try { await window.__atuaFetch('https://expired.badssl.com/'); } catch (_) {}
+      }
+      const resp = await window.__atuaFetch('https://httpbin.org/bytes/2000000');
+      return { status: resp.status, bodyLength: resp.body.length };
+    });
+    expect(result.status).toBe(200);
+    // httpbin caps at 102400
+    expect(result.bodyLength).toBe(102_400);
+  });
+
+  test('18.12: 10 large + 5 errors simultaneously', async ({ page }) => {
+    test.setTimeout(180_000);
+    await waitForWasmNative(page);
+    const result = await page.evaluate(async () => {
+      const promises = [
+        ...Array.from({ length: 10 }, () =>
+          window.__atuaFetch('https://httpbin.org/bytes/500000')
+            .then(r => ({ ok: true, size: r.body.length }))
+            .catch(() => ({ ok: false })),
+        ),
+        ...Array.from({ length: 5 }, () =>
+          window.__atuaFetch('https://expired.badssl.com/')
+            .then(() => ({ ok: true }))
+            .catch(() => ({ ok: false })),
+        ),
+      ];
+      const results = await Promise.all(promises);
+      return {
+        successes: results.filter(r => r.ok).length,
+        failures: results.filter(r => !r.ok).length,
+        sizesCorrect: results.filter(r => r.ok && r.size).every(r => r.size === 102_400),
+      };
+    });
+    expect(result.successes).toBeGreaterThanOrEqual(10);
+    expect(result.failures).toBeGreaterThanOrEqual(5);
+    expect(result.sizesCorrect).toBe(true);
   });
 });
 
