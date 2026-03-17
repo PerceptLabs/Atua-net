@@ -134,12 +134,8 @@ fn build_custom_tls_config(
         }
     }
 
-    let mut config = rustls::ClientConfig::builder()
-        .with_root_certificates(root_store)
-        .with_no_client_auth();
-
     // Apply TLS configuration overrides
-    if let Some(json) = tls_config_json {
+    let mut config = if let Some(json) = tls_config_json {
         #[derive(serde::Deserialize)]
         struct TlsOpts {
             #[serde(rename = "minVersion")]
@@ -149,29 +145,30 @@ fn build_custom_tls_config(
         let opts: TlsOpts = serde_json::from_str(json)
             .map_err(|e| JsValue::from_str(&format!("invalid tls config: {}", e)))?;
 
-        // Filter protocol versions based on minVersion
-        if let Some(ref min) = opts.min_version {
-            match min.as_str() {
-                "1.3" => {
-                    // Remove TLS 1.2 versions — only keep 1.3
-                    // rustls default includes both; we rebuild with 1.3 only
-                    // This is handled by not enabling tls12 feature, but since we have it,
-                    // we set the versions explicitly
-                }
-                "1.2" | _ => {
-                    // Default — both 1.2 and 1.3 are fine
-                }
-            }
-        }
-
-        if let Some(alpn) = opts.alpn {
-            config.alpn_protocols = alpn.into_iter().map(|s| s.into_bytes()).collect();
+        let c = if opts.min_version.as_deref() == Some("1.3") {
+            rustls::ClientConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
+                .with_root_certificates(root_store)
+                .with_no_client_auth()
         } else {
-            config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+            rustls::ClientConfig::builder()
+                .with_root_certificates(root_store)
+                .with_no_client_auth()
+        };
+
+        let mut c = c;
+        if let Some(alpn) = opts.alpn {
+            c.alpn_protocols = alpn.into_iter().map(|s| s.into_bytes()).collect();
+        } else {
+            c.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
         }
+        c
     } else {
-        config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
-    }
+        let mut c = rustls::ClientConfig::builder()
+            .with_root_certificates(root_store)
+            .with_no_client_auth();
+        c.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+        c
+    };
 
     Ok(Some(Arc::new(config)))
 }
@@ -337,7 +334,7 @@ pub async fn atua_fetch(
 async fn atua_fetch_with_redirects(
     url: String,
     method: String,
-    headers_json: String,
+    mut headers_json: String,
     body: Option<Vec<u8>>,
     wisp_send: Option<js_sys::Function>,
     wisp_recv: Option<js_sys::Function>,
@@ -393,6 +390,25 @@ async fn atua_fetch_with_redirects(
             .map_err(|e| format!("invalid redirect URL: {}", e))?;
 
         debug!("[redirect] {} → {}", current_url, resolved);
+
+        // Strip sensitive headers on cross-origin redirects
+        let current_origin = url::Url::parse(&current_url).ok().map(|u| u.origin());
+        let redirect_origin = Some(resolved.origin());
+        if current_origin != redirect_origin {
+            let mut hdrs: HashMap<String, String> = serde_json::from_str(&headers_json)
+                .unwrap_or_default();
+            let sensitive = ["Authorization", "authorization", "Cookie", "cookie",
+                           "Proxy-Authorization", "proxy-authorization"];
+            let had_sensitive = sensitive.iter().any(|k| hdrs.contains_key(*k));
+            for key in &sensitive {
+                hdrs.remove(*key);
+            }
+            if had_sensitive {
+                debug!("[redirect] stripped sensitive headers for cross-origin redirect");
+            }
+            headers_json = serde_json::to_string(&hdrs).unwrap_or_default();
+        }
+
         current_url = resolved.to_string();
 
         // 301/302/303: switch to GET, drop body
@@ -743,14 +759,20 @@ pub async fn atua_fetch_streaming(
     on_chunk: js_sys::Function,
     timeout_ms: Option<u32>,
     max_redirects: Option<u8>,
+    use_cookies: Option<bool>,
+    pins_json: Option<String>,
+    custom_ca_pem: Option<String>,
+    tls_config_json: Option<String>,
     use_native_wisp: Option<bool>,
     wisp_url: Option<String>,
 ) -> Result<JsValue, JsValue> {
     let native = use_native_wisp.unwrap_or(false);
+    let custom_tls = build_custom_tls_config(&custom_ca_pem, &tls_config_json)?;
     let fut = atua_fetch_streaming_inner(
         url.clone(), method.clone(), headers_json, body,
         wisp_send, wisp_recv, wisp_open, wisp_close,
-        on_chunk, native, &wisp_url,
+        on_chunk, use_cookies.unwrap_or(false), &pins_json, &custom_tls,
+        native, &wisp_url,
     );
 
     let result = if let Some(ms) = timeout_ms {
@@ -778,6 +800,9 @@ async fn atua_fetch_streaming_inner(
     wisp_open: Option<js_sys::Function>,
     wisp_close: Option<js_sys::Function>,
     on_chunk: js_sys::Function,
+    use_cookies: bool,
+    pins_json: &Option<String>,
+    custom_tls: &Option<Arc<rustls::ClientConfig>>,
     use_native_wisp: bool,
     wisp_url: &Option<String>,
 ) -> Result<JsValue, String> {
@@ -793,10 +818,15 @@ async fn atua_fetch_streaming_inner(
 
     let server_name = rustls::pki_types::ServerName::try_from(host.clone())
         .map_err(|e| format!("invalid hostname: {}", e))?;
-    let tls_config = TLS_CONFIG.with(|c| c.clone());
+    let tls_config = custom_tls.clone().unwrap_or_else(|| TLS_CONFIG.with(|c| c.clone()));
     let connector = tokio_rustls::TlsConnector::from(tls_config);
     let tls_stream = connector.connect(server_name, wisp).await
         .map_err(|e| format!("TLS error: {}", e))?;
+
+    // Certificate pinning verification
+    if let Some(ref pj) = pins_json {
+        verify_pins(&tls_stream, &host, pj)?;
+    }
 
     let alpn = tls_stream.get_ref().1.alpn_protocol();
     let is_h2 = alpn.map_or(false, |p| p == b"h2");
@@ -827,6 +857,26 @@ async fn atua_fetch_streaming_inner(
     for (key, value) in &user_headers {
         if !key.eq_ignore_ascii_case("host") {
             builder = builder.header(key.as_str(), value.as_str());
+        }
+    }
+
+    // Inject cookies from jar if enabled
+    if use_cookies {
+        let cookie_header = COOKIE_JAR.with(|jar| {
+            let jar = jar.borrow();
+            let request_url = url::Url::parse(&url).ok();
+            if let Some(ref u) = request_url {
+                let cookies: Vec<String> = jar.matches(u)
+                    .iter()
+                    .map(|c| format!("{}={}", c.name(), c.value()))
+                    .collect();
+                if cookies.is_empty() { None } else { Some(cookies.join("; ")) }
+            } else {
+                None
+            }
+        });
+        if let Some(cv) = cookie_header {
+            builder = builder.header("Cookie", cv);
         }
     }
 

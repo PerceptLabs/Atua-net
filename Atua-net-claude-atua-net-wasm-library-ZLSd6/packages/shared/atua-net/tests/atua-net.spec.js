@@ -1797,7 +1797,7 @@ test.describe('Tier 18 — Pressure Tests', () => {
 // ═══════════════════════════════════════════════════════════════
 
 test.describe('Rust Unit Tests', () => {
-  test('All 82 Rust unit tests pass', async () => {
+  test('Rust unit tests pass', async () => {
     const { execSync } = await import('node:child_process');
     const result = execSync('cargo test 2>&1', {
       cwd: process.cwd(),
@@ -1805,7 +1805,7 @@ test.describe('Rust Unit Tests', () => {
       timeout: 60_000,
     });
     expect(result).toContain('test result: ok');
-    // Match cargo test output — test count may change as tests are added/removed
     expect(result).toMatch(/\d+ passed/);
+    expect(result).not.toContain('FAILED');
   });
 });

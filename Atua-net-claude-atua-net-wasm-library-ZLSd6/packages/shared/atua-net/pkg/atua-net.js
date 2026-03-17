@@ -296,10 +296,19 @@ export class AtuaNetClient {
     const maxRedirects = options.maxRedirects ?? this.maxRedirects;
     const onChunk = options.onChunk || (() => {});
 
+    const useCookies = options.cookies ?? this.cookies;
+    const pins = options.pins || this.pins;
+    const pinsJson = Object.keys(pins).length > 0 ? JSON.stringify(pins) : undefined;
+    const customCaPem = this.ca.length > 0 ? this.ca.join('\n') : undefined;
+    const tlsConfigJson = Object.keys(this.tls).length > 0 ? JSON.stringify(this.tls) : undefined;
+    const np = this._nativeParams();
+
     const result = await wasm.atua_fetch_streaming(
       url, method, headersJson, body,
       cb.wisp_send, cb.wisp_recv, cb.wisp_open, cb.wisp_close,
       onChunk, timeoutMs, maxRedirects,
+      useCookies || undefined, pinsJson, customCaPem, tlsConfigJson,
+      np.use_native_wisp, np.wisp_url,
     );
 
     return {
@@ -366,7 +375,7 @@ export class AtuaNetClient {
    * Close all connections and clean up.
    */
   destroy() {
-    this._bridge.destroy();
+    if (this._bridge) this._bridge.destroy();
   }
 }
 
