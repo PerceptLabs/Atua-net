@@ -1793,6 +1793,450 @@ test.describe('Tier 18 — Pressure Tests', () => {
 });
 
 // ═══════════════════════════════════════════════════════════════
+// Tier 19a — Relay Chaos Tests
+// ═══════════════════════════════════════════════════════════════
+
+test.describe('Tier 19a — Relay Chaos', () => {
+  test.afterEach(async ({ page }) => {
+    await page.evaluate(() => fetch('/relay/reset'));
+  });
+
+  test('19a.1: Stream dropped mid-transfer — others survive', async ({ page }) => {
+    test.setTimeout(30_000);
+    await waitForWasmNative(page);
+    const result = await page.evaluate(async () => {
+      await fetch('/relay/drop-stream');
+      const results = await Promise.all([
+        window.__atuaFetch('https://httpbin.org/bytes/10000').then(r => ({ ok: true, len: r.body.length })).catch(() => ({ ok: false })),
+        window.__atuaFetch('https://httpbin.org/get').then(r => ({ ok: r.status === 200 })).catch(() => ({ ok: false })),
+        window.__atuaFetch('https://httpbin.org/ip').then(r => ({ ok: r.status === 200 })).catch(() => ({ ok: false })),
+      ]);
+      const successCount = results.filter(r => r.ok).length;
+      const recovery = await window.__atuaFetch('https://httpbin.org/get');
+      return { successCount, recoveryOk: recovery.status === 200 };
+    });
+    expect(result.successCount).toBeGreaterThanOrEqual(2);
+    expect(result.recoveryOk).toBe(true);
+  });
+
+  test('19a.2: Stream stalls 5s then resumes', async ({ page }) => {
+    test.setTimeout(30_000);
+    await waitForWasmNative(page);
+    const result = await page.evaluate(async () => {
+      await fetch('/relay/stall-stream');
+      const start = Date.now();
+      const resp = await window.__atuaFetch('https://httpbin.org/get');
+      const elapsed = Date.now() - start;
+      const next = await window.__atuaFetch('https://httpbin.org/get');
+      return { status: resp.status, elapsed, nextOk: next.status === 200 };
+    });
+    expect(result.status).toBe(200);
+    expect(result.elapsed).toBeGreaterThan(4000);
+    expect(result.nextOk).toBe(true);
+  });
+
+  test('19a.3: WebSocket killed — reconnection works', async ({ page }) => {
+    test.setTimeout(30_000);
+    await waitForWasmNative(page);
+    const result = await page.evaluate(async () => {
+      await fetch('/relay/kill-websocket');
+      // First request may or may not fail (race with 500ms WS kill delay)
+      try { await window.__atuaFetch('https://httpbin.org/get'); } catch (_) {}
+      await new Promise(r => setTimeout(r, 2000));
+      // Recovery request must succeed — tests get_or_create() reconnection
+      const resp = await window.__atuaFetch('https://httpbin.org/get');
+      return { recoveryStatus: resp.status };
+    });
+    expect(result.recoveryStatus).toBe(200);
+  });
+
+  test('19a.4: Malformed frame — client survives', async ({ page }) => {
+    test.setTimeout(30_000);
+    await waitForWasmNative(page);
+    const result = await page.evaluate(async () => {
+      await fetch('/relay/send-garbage');
+      const resp = await window.__atuaFetch('https://httpbin.org/get');
+      const next = await window.__atuaFetch('https://httpbin.org/get');
+      return { status: resp.status, nextOk: next.status === 200 };
+    });
+    expect(result.status).toBe(200);
+    expect(result.nextOk).toBe(true);
+  });
+
+  test('19a.5: Multiple faults in sequence — no accumulation', async ({ page }) => {
+    test.setTimeout(120_000);
+    await waitForWasmNative(page);
+    const result = await page.evaluate(async () => {
+      // Drop
+      await fetch('/relay/drop-stream');
+      try { await window.__atuaFetch('https://httpbin.org/bytes/10000'); } catch (_) {}
+      const r1 = await window.__atuaFetch('https://httpbin.org/get');
+      // Garbage
+      await fetch('/relay/send-garbage');
+      const r2 = await window.__atuaFetch('https://httpbin.org/get');
+      // Kill WS
+      await fetch('/relay/kill-websocket');
+      try { await window.__atuaFetch('https://httpbin.org/get'); } catch (_) {}
+      await new Promise(r => setTimeout(r, 3000));
+      // May need a second attempt if reconnection is slow
+      let r3;
+      try { r3 = await window.__atuaFetch('https://httpbin.org/get'); }
+      catch (_) { await new Promise(r => setTimeout(r, 2000)); r3 = await window.__atuaFetch('https://httpbin.org/get'); }
+      // Final: 3 parallel clean
+      const final3 = await Promise.all([
+        window.__atuaFetch('https://httpbin.org/get'),
+        window.__atuaFetch('https://httpbin.org/ip'),
+        window.__atuaFetch('https://httpbin.org/headers'),
+      ]);
+      return {
+        r1ok: r1.status === 200,
+        r2ok: r2.status === 200,
+        r3ok: r3.status === 200,
+        finalAllOk: final3.every(r => r.status === 200),
+      };
+    });
+    expect(result.r1ok).toBe(true);
+    expect(result.r2ok).toBe(true);
+    expect(result.r3ok).toBe(true);
+    expect(result.finalAllOk).toBe(true);
+  });
+
+  test('19a.6: Streaming survives another stream death', async ({ page }) => {
+    test.setTimeout(60_000);
+    await waitForWasmNative(page);
+    const result = await page.evaluate(async () => {
+      const streamPromise = window.__atuaFetchStreaming('https://httpbin.org/stream/20');
+      await new Promise(r => setTimeout(r, 100)); // let streaming start
+      await fetch('/relay/drop-stream');
+      try { await window.__atuaFetch('https://httpbin.org/bytes/10000'); } catch (_) {}
+      const streamResult = await streamPromise;
+      const lines = streamResult.chunks.map(c => new TextDecoder().decode(c)).join('').trim().split('\n').filter(l => l);
+      const recovery = await window.__atuaFetch('https://httpbin.org/get');
+      return { lineCount: lines.length, recoveryOk: recovery.status === 200 };
+    });
+    expect(result.lineCount).toBe(20);
+    expect(result.recoveryOk).toBe(true);
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════
+// Tier 19b — Backpressure Tests
+// ═══════════════════════════════════════════════════════════════
+
+test.describe('Tier 19b — Backpressure', () => {
+  test('19b.1: Streaming + diagnostics check', async ({ page }) => {
+    test.setTimeout(60_000);
+    await waitForWasmNative(page);
+    const result = await page.evaluate(async () => {
+      const resp = await window.__atuaFetchStreaming('https://httpbin.org/stream/50');
+      const lines = resp.chunks.map(c => new TextDecoder().decode(c)).join('').trim().split('\n').filter(l => l);
+      await new Promise(r => setTimeout(r, 100));
+      const diag = window.__atuaDiagnostics();
+      const recovery = await window.__atuaFetch('https://httpbin.org/get');
+      return { lineCount: lines.length, wispStreams: diag.wispStreams, recoveryOk: recovery.status === 200 };
+    });
+    expect(result.lineCount).toBe(50);
+    expect(result.wispStreams).toBe(0);
+    expect(result.recoveryOk).toBe(true);
+  });
+
+  test('19b.2: Large response + diagnostics', async ({ page }) => {
+    test.setTimeout(60_000);
+    await waitForWasmNative(page);
+    const result = await page.evaluate(async () => {
+      const resp = await window.__atuaFetch('https://httpbin.org/bytes/500000');
+      await new Promise(r => setTimeout(r, 500)); // let async cleanup settle
+      const diag = window.__atuaDiagnostics();
+      return { status: resp.status, bodyLen: resp.body.length, wispStreams: diag.wispStreams, storedStreams: diag.storedStreams };
+    });
+    expect(result.status).toBe(200);
+    expect(result.bodyLen).toBeGreaterThanOrEqual(100_000);
+    // wispStreams may be > 0 if connection pooling keeps the Wisp stream alive for reuse
+    expect(result.wispStreams).toBeLessThanOrEqual(2);
+    expect(result.storedStreams).toBe(0);
+  });
+
+  test('19b.3: 5 concurrent large + diagnostics', async ({ page }) => {
+    test.setTimeout(60_000);
+    await waitForWasmNative(page);
+    const result = await page.evaluate(async () => {
+      const results = await Promise.all(
+        Array.from({ length: 5 }, () => window.__atuaFetch('https://httpbin.org/bytes/100000'))
+      );
+      await new Promise(r => setTimeout(r, 100));
+      const diag = window.__atuaDiagnostics();
+      return {
+        allOk: results.every(r => r.status === 200),
+        allCorrectSize: results.every(r => r.body.length >= 100_000),
+        wispStreams: diag.wispStreams,
+      };
+    });
+    expect(result.allOk).toBe(true);
+    expect(result.allCorrectSize).toBe(true);
+    expect(result.wispStreams).toBe(0);
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════
+// Tier 19c — Streaming Semantic Tests
+// ═══════════════════════════════════════════════════════════════
+
+test.describe('Tier 19c — Streaming Semantics', () => {
+  test('19c.1: NDJSON lines parseable from chunks', async ({ page }) => {
+    test.setTimeout(30_000);
+    await waitForWasmNative(page);
+    const result = await page.evaluate(async () => {
+      const resp = await window.__atuaFetchStreaming('https://httpbin.org/stream/20');
+      const text = resp.chunks.map(c => new TextDecoder().decode(c)).join('');
+      const lines = text.trim().split('\n').filter(l => l);
+      const allValid = lines.every(l => { try { JSON.parse(l); return true; } catch { return false; } });
+      return { count: lines.length, allValid };
+    });
+    expect(result.count).toBe(20);
+    expect(result.allValid).toBe(true);
+  });
+
+  test('19c.2: Empty response (204) via streaming', async ({ page }) => {
+    test.setTimeout(15_000);
+    await waitForWasmNative(page);
+    const result = await page.evaluate(async () => {
+      const resp = await window.__atuaFetchStreaming('https://httpbin.org/status/204');
+      const text = resp.chunks.map(c => new TextDecoder().decode(c)).join('');
+      return { status: resp.status, bodyEmpty: text.length === 0, chunkCount: resp.chunks.length };
+    });
+    expect(result.status).toBe(204);
+  });
+
+  test('19c.3: 100 NDJSON lines via streaming', async ({ page }) => {
+    test.setTimeout(60_000);
+    await waitForWasmNative(page);
+    const result = await page.evaluate(async () => {
+      const resp = await window.__atuaFetchStreaming('https://httpbin.org/stream/100');
+      const text = resp.chunks.map(c => new TextDecoder().decode(c)).join('');
+      const lines = text.trim().split('\n').filter(l => l);
+      return { count: lines.length, chunkCount: resp.chunks.length };
+    });
+    expect(result.count).toBe(100);
+    expect(result.chunkCount).toBeGreaterThan(1);
+  });
+
+  test('19c.4: Alternating streaming and regular', async ({ page }) => {
+    test.setTimeout(60_000);
+    await waitForWasmNative(page);
+    const result = await page.evaluate(async () => {
+      const s1 = await window.__atuaFetchStreaming('https://httpbin.org/stream/10');
+      const l1 = s1.chunks.map(c => new TextDecoder().decode(c)).join('').trim().split('\n').filter(l => l);
+      const r1 = await window.__atuaFetch('https://httpbin.org/get');
+      const s2 = await window.__atuaFetchStreaming('https://httpbin.org/stream/10');
+      const l2 = s2.chunks.map(c => new TextDecoder().decode(c)).join('').trim().split('\n').filter(l => l);
+      const r2 = await window.__atuaFetch('https://httpbin.org/post', { method: 'POST', body: 'test' });
+      return { l1: l1.length, r1: r1.status, l2: l2.length, r2: r2.status };
+    });
+    expect(result.l1).toBe(10);
+    expect(result.r1).toBe(200);
+    expect(result.l2).toBe(10);
+    expect(result.r2).toBe(200);
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════
+// Tier 20 — Automated Soak Test
+// ═══════════════════════════════════════════════════════════════
+
+test.describe('Tier 20 — Soak Test', () => {
+  test.skip(process.env.SKIP_SOAK === '1', 'soak test skipped via SKIP_SOAK=1');
+
+  test('20.1: Automated soak — 5 phases, diagnostics, health assertions', async ({ page }) => {
+    const soakMinutes = parseInt(process.env.SOAK_MINUTES || '10', 10);
+    const soakMs = soakMinutes * 60 * 1000;
+    test.setTimeout(soakMs + 2 * 60 * 1000); // duration + 2min buffer
+
+    await waitForWasmNative(page);
+
+    const result = await page.evaluate(async (durationMs) => {
+      const MAX_LATENCIES = 200;
+      const MAX_DIAG = 5000;
+      const MAX_HEAP = 5000;
+      const MAX_ERRORS = 100;
+
+      let totalReqs = 0, successes = 0, failures = 0, deliberateErrors = 0;
+      const latencies = [];
+      const diagSnapshots = [];
+      const heapSnapshots = [];
+      const errorLog = [];
+      let baselineLatencies = [];
+
+      function recordLatency(ms) {
+        latencies.push(ms);
+        if (latencies.length > MAX_LATENCIES) latencies.shift();
+        if (baselineLatencies.length < 20) baselineLatencies.push(ms);
+      }
+
+      function percentile(arr, p) {
+        if (!arr.length) return 0;
+        const s = [...arr].sort((a, b) => a - b);
+        return s[Math.ceil(p / 100 * s.length) - 1] || 0;
+      }
+
+      function sampleDiag() {
+        try {
+          const d = window.__atuaDiagnostics();
+          diagSnapshots.push({ t: Date.now(), ...d });
+          if (diagSnapshots.length > MAX_DIAG) diagSnapshots.shift();
+        } catch (_) {}
+        try {
+          const heap = performance.memory ? performance.memory.usedJSHeapSize : null;
+          heapSnapshots.push({ t: Date.now(), heap });
+          if (heapSnapshots.length > MAX_HEAP) heapSnapshots.shift();
+        } catch (_) {}
+      }
+
+      async function doReq(url, opts) {
+        const start = Date.now();
+        try {
+          const r = await window.__atuaFetch(url, opts || {});
+          const ms = Date.now() - start;
+          totalReqs++; successes++;
+          recordLatency(ms);
+          return r;
+        } catch (e) {
+          totalReqs++; failures++;
+          recordLatency(Date.now() - start);
+          errorLog.push({ t: Date.now(), url, err: String(e).slice(0, 200) });
+          if (errorLog.length > MAX_ERRORS) errorLog.shift();
+          throw e;
+        }
+      }
+
+      async function doDeliberateError() {
+        try { await doReq('https://expired.badssl.com/'); } catch (_) {
+          deliberateErrors++;
+        }
+      }
+
+      const phaseTime = Math.min(durationMs / 5, 2 * 60 * 1000);
+      const soakStart = Date.now();
+
+      // Diagnostics sampling interval
+      const diagTimer = setInterval(sampleDiag, 10000);
+      sampleDiag(); // initial sample
+
+      try {
+        while (Date.now() - soakStart < durationMs) {
+          // Phase 1: Sequential
+          const p1End = Date.now() + phaseTime;
+          while (Date.now() < p1End && Date.now() - soakStart < durationMs) {
+            try { await doReq('https://httpbin.org/get'); } catch (_) {}
+            await new Promise(r => setTimeout(r, 2000));
+          }
+
+          // Phase 2: Concurrent
+          const p2End = Date.now() + phaseTime;
+          while (Date.now() < p2End && Date.now() - soakStart < durationMs) {
+            try {
+              await Promise.all([
+                doReq('https://httpbin.org/get'),
+                doReq('https://httpbin.org/ip'),
+                doReq('https://httpbin.org/headers'),
+              ]);
+            } catch (_) {}
+            await new Promise(r => setTimeout(r, 5000));
+          }
+
+          // Phase 3: Mixed sizes
+          const p3End = Date.now() + phaseTime;
+          let p3i = 0;
+          while (Date.now() < p3End && Date.now() - soakStart < durationMs) {
+            try {
+              if (p3i % 2 === 0) await doReq('https://httpbin.org/get');
+              else await doReq('https://httpbin.org/bytes/100000');
+            } catch (_) {}
+            p3i++;
+            await new Promise(r => setTimeout(r, 1000));
+          }
+
+          // Phase 4: Streaming + regular
+          const p4End = Date.now() + phaseTime;
+          while (Date.now() < p4End && Date.now() - soakStart < durationMs) {
+            try {
+              await window.__atuaFetchStreaming('https://httpbin.org/stream/10');
+              totalReqs++; successes++;
+            } catch (_) { totalReqs++; failures++; }
+            await new Promise(r => setTimeout(r, 1000));
+            try { await doReq('https://httpbin.org/get'); } catch (_) {}
+            await new Promise(r => setTimeout(r, 1000));
+          }
+
+          // Phase 5: Chaos
+          const p5End = Date.now() + phaseTime;
+          while (Date.now() < p5End && Date.now() - soakStart < durationMs) {
+            const r = Math.random();
+            try {
+              if (r < 0.1) { await doDeliberateError(); }
+              else if (r < 0.3) { await doReq('https://httpbin.org/bytes/100000'); }
+              else if (r < 0.5) {
+                await window.__atuaFetchStreaming('https://httpbin.org/stream/5');
+                totalReqs++; successes++;
+              }
+              else if (r < 0.7) {
+                await Promise.all([doReq('https://httpbin.org/get'), doReq('https://httpbin.org/ip')]);
+              }
+              else { await doReq('https://httpbin.org/get'); }
+            } catch (_) {}
+            await new Promise(r => setTimeout(r, 1000 + Math.random() * 2000));
+          }
+        }
+      } finally {
+        clearInterval(diagTimer);
+        sampleDiag(); // final sample
+      }
+
+      // Compute summary
+      const finalDiag = diagSnapshots.length ? diagSnapshots[diagSnapshots.length - 1] : {};
+      const initialHeap = heapSnapshots.length ? heapSnapshots[0].heap : null;
+      const finalHeap = heapSnapshots.length ? heapSnapshots[heapSnapshots.length - 1].heap : null;
+      const maxWispStreams = diagSnapshots.length ? Math.max(...diagSnapshots.map(d => d.wispStreams || 0)) : 0;
+      const baselineP95 = percentile(baselineLatencies, 95);
+      const finalP50 = percentile(latencies, 50);
+      const finalP95 = percentile(latencies, 95);
+      const finalP99 = percentile(latencies, 99);
+      const unexpectedFailures = failures - deliberateErrors;
+      const unexpectedErrorRate = totalReqs > 0 ? (unexpectedFailures / totalReqs) * 100 : 0;
+
+      return {
+        totalReqs, successes, failures, deliberateErrors, unexpectedFailures, unexpectedErrorRate,
+        finalP50, finalP95, finalP99, baselineP95,
+        finalWispStreams: finalDiag.wispStreams || 0,
+        finalWispConns: finalDiag.wispConnections || 0,
+        finalPool: finalDiag.pooledConnections || 0,
+        maxWispStreams,
+        initialHeapMB: initialHeap ? (initialHeap / 1048576).toFixed(1) : null,
+        finalHeapMB: finalHeap ? (finalHeap / 1048576).toFixed(1) : null,
+        heapRatio: (initialHeap && finalHeap) ? (finalHeap / initialHeap).toFixed(2) : null,
+        diagCount: diagSnapshots.length,
+        errorLogCount: errorLog.length,
+        durationSec: Math.round((Date.now() - soakStart) / 1000),
+      };
+    }, soakMs);
+
+    // Log summary for visibility
+    console.log(`Soak results (${result.durationSec}s): ${result.totalReqs} reqs, ${result.successes} ok, ${result.failures} fail (${result.deliberateErrors} deliberate), p50=${result.finalP50}ms p95=${result.finalP95}ms p99=${result.finalP99}ms, heap=${result.initialHeapMB}→${result.finalHeapMB}MB (${result.heapRatio}x), maxWispStreams=${result.maxWispStreams}, finalWispStreams=${result.finalWispStreams}`);
+
+    // Assertions
+    expect(result.totalReqs).toBeGreaterThan(0);
+    expect(result.unexpectedErrorRate).toBeLessThan(2);
+    expect(result.finalWispStreams).toBeLessThanOrEqual(2); // connection pool may hold 1-2
+    expect(result.maxWispStreams).toBeLessThanOrEqual(10);
+    if (result.baselineP95 > 0) {
+      expect(result.finalP95).toBeLessThan(result.baselineP95 * 3);
+    }
+    if (result.heapRatio !== null) {
+      expect(parseFloat(result.heapRatio)).toBeLessThan(3);
+    }
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════
 // Rust Unit Tests (cargo test)
 // ═══════════════════════════════════════════════════════════════
 

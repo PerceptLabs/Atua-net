@@ -1189,6 +1189,29 @@ pub async fn atua_ws_close(key: String) -> Result<(), JsValue> {
     result.map_err(|e| JsValue::from_str(&e))
 }
 
+// ─── Diagnostics ─────────────────────────────────────────────────
+
+#[wasm_bindgen]
+pub fn atua_diagnostics() -> JsValue {
+    let wisp_streams: usize = wisp::WISP_CLIENTS.with(|clients| {
+        clients.borrow().values().map(|c| c.stream_count()).sum()
+    });
+    let wisp_connections: usize = wisp::WISP_CLIENTS.with(|clients| {
+        clients.borrow().len()
+    });
+    let pooled_connections: usize = CONN_POOL.with(|p| p.borrow().len());
+    let stored_streams: usize = STREAMS.with(|s| s.borrow().len());
+    let ws_streams: usize = WS_STREAMS.with(|s| s.borrow().len());
+
+    let obj = js_sys::Object::new();
+    js_sys::Reflect::set(&obj, &"wispStreams".into(), &JsValue::from_f64(wisp_streams as f64)).ok();
+    js_sys::Reflect::set(&obj, &"wispConnections".into(), &JsValue::from_f64(wisp_connections as f64)).ok();
+    js_sys::Reflect::set(&obj, &"pooledConnections".into(), &JsValue::from_f64(pooled_connections as f64)).ok();
+    js_sys::Reflect::set(&obj, &"storedStreams".into(), &JsValue::from_f64(stored_streams as f64)).ok();
+    js_sys::Reflect::set(&obj, &"wsStreams".into(), &JsValue::from_f64(ws_streams as f64)).ok();
+    obj.into()
+}
+
 // ─── Tests ───────────────────────────────────────────────────────
 
 #[cfg(test)]

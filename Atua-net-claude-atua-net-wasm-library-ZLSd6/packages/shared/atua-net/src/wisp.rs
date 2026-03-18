@@ -352,6 +352,16 @@ impl WispClient {
         self.ws.send_with_u8_array(&bytes)
             .map_err(|e| format!("WebSocket send failed: {:?}", e))
     }
+
+    /// Number of active streams in this client.
+    pub fn stream_count(&self) -> usize {
+        self.streams.borrow().len()
+    }
+
+    /// WebSocket ready state (0=CONNECTING, 1=OPEN, 2=CLOSING, 3=CLOSED).
+    pub fn ws_ready_state(&self) -> u16 {
+        self.ws.ready_state()
+    }
 }
 
 // ─── Thread-Local Client Pool ────────────────────────────────────

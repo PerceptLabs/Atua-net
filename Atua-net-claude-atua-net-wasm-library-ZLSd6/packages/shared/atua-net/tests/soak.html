@@ -1,0 +1,334 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>atua-net Soak Test</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { background: #1a1a1a; color: #e0e0e0; font-family: 'Consolas', 'Monaco', monospace; font-size: 13px; padding: 16px; }
+.top-bar { display: flex; align-items: center; gap: 16px; margin-bottom: 16px; }
+button { background: #333; color: #e0e0e0; border: 1px solid #555; padding: 8px 20px; cursor: pointer; font-family: inherit; font-size: 13px; }
+button:hover { background: #444; }
+button.active { background: #2a6; color: #fff; }
+.elapsed { font-size: 18px; font-weight: bold; color: #6cf; }
+.phase { color: #aaa; }
+.grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 10px; margin-bottom: 16px; }
+.card { background: #252525; border: 1px solid #333; border-radius: 6px; padding: 12px; }
+.card .label { color: #888; font-size: 11px; text-transform: uppercase; margin-bottom: 4px; }
+.card .value { font-size: 22px; font-weight: bold; }
+.card .value.green { color: #4c8; }
+.card .value.yellow { color: #db4; }
+.card .value.red { color: #e55; }
+canvas { width: 100%; height: 150px; background: #222; border: 1px solid #333; border-radius: 6px; margin-bottom: 16px; }
+.log { background: #1e1e1e; border: 1px solid #333; border-radius: 6px; height: 200px; overflow-y: auto; padding: 8px; font-size: 11px; }
+.log .entry { margin-bottom: 2px; }
+.log .warn { color: #db4; }
+.log .error { color: #e55; }
+.log .info { color: #6cf; }
+h3 { color: #888; font-size: 12px; margin-bottom: 8px; text-transform: uppercase; }
+</style>
+</head>
+<body>
+<div class="top-bar">
+  <button id="startBtn" onclick="toggleSoak()">Start</button>
+  <span class="elapsed" id="elapsed">00:00:00</span>
+  <span class="phase" id="phase">Idle</span>
+</div>
+
+<h3>Metrics</h3>
+<div class="grid" id="metrics">
+  <div class="card"><div class="label">Total Requests</div><div class="value" id="mTotal">0</div></div>
+  <div class="card"><div class="label">Successes</div><div class="value green" id="mSuccess">0</div></div>
+  <div class="card"><div class="label">Failures</div><div class="value" id="mFail">0</div></div>
+  <div class="card"><div class="label">Error Rate</div><div class="value" id="mRate">0%</div></div>
+  <div class="card"><div class="label">Latency p50</div><div class="value" id="mP50">-</div></div>
+  <div class="card"><div class="label">Latency p95</div><div class="value" id="mP95">-</div></div>
+  <div class="card"><div class="label">Heap MB</div><div class="value" id="mHeap">?</div></div>
+</div>
+
+<h3>Internal State</h3>
+<div class="grid" id="state">
+  <div class="card"><div class="label">Wisp Streams</div><div class="value" id="sWispStreams">-</div></div>
+  <div class="card"><div class="label">Wisp Connections</div><div class="value" id="sWispConns">-</div></div>
+  <div class="card"><div class="label">HTTP Pool</div><div class="value" id="sPool">-</div></div>
+  <div class="card"><div class="label">Stored Streams</div><div class="value" id="sStored">-</div></div>
+</div>
+
+<h3>Memory Over Time</h3>
+<canvas id="chart" height="150"></canvas>
+
+<h3>Log</h3>
+<div class="log" id="log"></div>
+
+<script type="module">
+import wasmInit, { atua_fetch, atua_fetch_streaming, atua_diagnostics } from '../wasm-pkg/atua_net.js';
+import { WispConnection } from '../node_modules/@mercuryworkshop/wisp-client-js/src/wisp.mjs';
+
+// ── State ────────────────────────────────────────────────────
+let running = false;
+let startTime = 0;
+let totalReqs = 0, successes = 0, failures = 0;
+let latencies = [];
+let heapSamples = [];
+let logEntries = [];
+let currentPhase = 'Idle';
+let initialHeap = 0;
+let baselineP95 = 0;
+const MAX_LATENCIES = 200;
+const MAX_HEAP = 10000;
+const MAX_LOG = 500;
+const WISP_URL = 'ws://localhost:3457/';
+
+// ── WASM Setup ───────────────────────────────────────────────
+let wasm = null;
+class SoakWispBridge {
+  constructor() { this.conn = null; this._promise = null; }
+  async ensure() {
+    if (this._promise) return this._promise;
+    if (this.conn?.connected) return;
+    this.conn = new WispConnection(WISP_URL);
+    this._promise = new Promise((res, rej) => {
+      this.conn.addEventListener('open', () => { this._promise = null; res(); }, { once: true });
+      this.conn.addEventListener('error', () => { this._promise = null; rej(new Error('wisp fail')); }, { once: true });
+    });
+    return this._promise;
+  }
+  callbacks() {
+    const b = this;
+    const streams = new Map();
+    let nextId = 1;
+    return {
+      wisp_open: async (host, port) => {
+        await b.ensure();
+        const s = b.conn.create_stream(host, port);
+        const id = String(nextId++);
+        const q = [], w = [];
+        let closed = false;
+        s.addEventListener('message', e => { const d = e.data instanceof Uint8Array ? e.data : new Uint8Array(e.data); w.length ? w.shift()(d) : q.push(d); });
+        s.addEventListener('close', () => { closed = true; while (w.length) w.shift()(new Uint8Array(0)); });
+        streams.set(id, { s, q, w, get closed() { return closed; } });
+        return id;
+      },
+      wisp_send: async (id, data) => { streams.get(id)?.s.send(data instanceof Uint8Array ? data : new Uint8Array(data)); },
+      wisp_recv: async (id) => { const e = streams.get(id); if (!e) return new Uint8Array(0); return e.q.length ? e.q.shift() : e.closed ? new Uint8Array(0) : new Promise(r => e.w.push(r)); },
+      wisp_close: async (id) => { const e = streams.get(id); if (e) { try { e.s.close(); } catch(_){} streams.delete(id); } },
+    };
+  }
+}
+const bridge = new SoakWispBridge();
+
+async function soakFetch(url, opts = {}) {
+  const cb = bridge.callbacks();
+  const method = opts.method || 'GET';
+  const headers = JSON.stringify(opts.headers || {});
+  let body = null;
+  if (opts.body) body = typeof opts.body === 'string' ? new TextEncoder().encode(opts.body) : opts.body;
+  const r = await atua_fetch(url, method, headers, body, cb.wisp_send, cb.wisp_recv, cb.wisp_open, cb.wisp_close);
+  return { status: r.status, headers: r.headers, body: r.body instanceof Uint8Array ? r.body : new Uint8Array(r.body) };
+}
+
+async function soakFetchStreaming(url) {
+  const cb = bridge.callbacks();
+  const chunks = [];
+  const onChunk = c => chunks.push(c instanceof Uint8Array ? c : new Uint8Array(c));
+  const r = await atua_fetch_streaming(url, 'GET', '{}', null, cb.wisp_send, cb.wisp_recv, cb.wisp_open, cb.wisp_close, onChunk);
+  return { status: r.status, chunks };
+}
+
+// ── Metrics ──────────────────────────────────────────────────
+function recordLatency(ms) {
+  latencies.push(ms);
+  if (latencies.length > MAX_LATENCIES) latencies.shift();
+}
+function percentile(arr, p) {
+  if (!arr.length) return 0;
+  const s = [...arr].sort((a,b) => a-b);
+  const i = Math.ceil(p/100 * s.length) - 1;
+  return s[Math.max(0, i)];
+}
+function getHeapMB() {
+  if (performance.memory) return (performance.memory.usedJSHeapSize / 1048576).toFixed(1);
+  return '?';
+}
+function addLog(type, msg) {
+  logEntries.push({ time: new Date().toISOString().substr(11,8), type, msg });
+  if (logEntries.length > MAX_LOG) logEntries.shift();
+}
+
+// ── UI ───────────────────────────────────────────────────────
+function updateUI() {
+  const el = (id) => document.getElementById(id);
+  if (startTime) {
+    const s = Math.floor((Date.now() - startTime)/1000);
+    const h = String(Math.floor(s/3600)).padStart(2,'0');
+    const m = String(Math.floor(s%3600/60)).padStart(2,'0');
+    const sec = String(s%60).padStart(2,'0');
+    el('elapsed').textContent = `${h}:${m}:${sec}`;
+  }
+  el('phase').textContent = currentPhase;
+  el('mTotal').textContent = totalReqs;
+  el('mSuccess').textContent = successes;
+  el('mFail').textContent = failures;
+  const rate = totalReqs ? ((failures/totalReqs)*100).toFixed(1) : '0.0';
+  el('mRate').textContent = rate + '%';
+  el('mRate').className = 'value ' + (parseFloat(rate) >= 2 ? 'red' : parseFloat(rate) > 0 ? 'yellow' : 'green');
+  el('mP50').textContent = percentile(latencies, 50) + 'ms';
+  el('mP95').textContent = percentile(latencies, 95) + 'ms';
+  el('mHeap').textContent = getHeapMB();
+  try {
+    const d = atua_diagnostics();
+    el('sWispStreams').textContent = d.wispStreams;
+    el('sWispStreams').className = 'value ' + (d.wispStreams > 5 ? 'red' : d.wispStreams > 0 ? 'yellow' : 'green');
+    el('sWispConns').textContent = d.wispConnections;
+    el('sPool').textContent = d.pooledConnections;
+    el('sStored').textContent = d.storedStreams;
+  } catch(_) {}
+
+  const logDiv = el('log');
+  logDiv.innerHTML = logEntries.map(e => `<div class="entry ${e.type}">[${e.time}] ${e.msg}</div>`).join('');
+  logDiv.scrollTop = logDiv.scrollHeight;
+}
+
+function drawChart() {
+  const canvas = document.getElementById('chart');
+  const ctx = canvas.getContext('2d');
+  canvas.width = canvas.clientWidth;
+  canvas.height = 150;
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  if (heapSamples.length < 2) return;
+  const maxHeap = Math.max(...heapSamples.map(s => s.heap), 50);
+  ctx.strokeStyle = '#6cf';
+  ctx.lineWidth = 1.5;
+  ctx.beginPath();
+  heapSamples.forEach((s, i) => {
+    const x = (i / (heapSamples.length - 1)) * canvas.width;
+    const y = canvas.height - (s.heap / maxHeap) * (canvas.height - 10) - 5;
+    i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+  });
+  ctx.stroke();
+}
+
+// ── Phases ────────────────────────────────────────────────────
+async function doRequest(url, opts) {
+  const start = Date.now();
+  try {
+    const r = await soakFetch(url, opts);
+    const ms = Date.now() - start;
+    totalReqs++; successes++;
+    recordLatency(ms);
+    return r;
+  } catch(e) {
+    totalReqs++; failures++;
+    recordLatency(Date.now() - start);
+    throw e;
+  }
+}
+
+async function phase1() { // Sequential baseline
+  currentPhase = 'Phase 1: Sequential baseline';
+  const end = Date.now() + 30*60*1000;
+  while (running && Date.now() < end) {
+    try { await doRequest('https://httpbin.org/get'); } catch(_) {}
+    await new Promise(r => setTimeout(r, 2000));
+  }
+}
+async function phase2() { // Concurrent
+  currentPhase = 'Phase 2: Concurrent multiplexing';
+  const end = Date.now() + 30*60*1000;
+  while (running && Date.now() < end) {
+    try { await Promise.all([doRequest('https://httpbin.org/get'), doRequest('https://httpbin.org/ip'), doRequest('https://httpbin.org/headers')]); } catch(_) {}
+    await new Promise(r => setTimeout(r, 5000));
+  }
+}
+async function phase3() { // Mixed sizes
+  currentPhase = 'Phase 3: Mixed sizes';
+  const end = Date.now() + 30*60*1000;
+  let i = 0;
+  while (running && Date.now() < end) {
+    try { if (i%2===0) await doRequest('https://httpbin.org/get'); else await doRequest('https://httpbin.org/bytes/100000'); } catch(_) {}
+    i++;
+    await new Promise(r => setTimeout(r, 1000));
+  }
+}
+async function phase4() { // Streaming + regular
+  currentPhase = 'Phase 4: Streaming + regular';
+  const end = Date.now() + 30*60*1000;
+  while (running && Date.now() < end) {
+    try { await soakFetchStreaming('https://httpbin.org/stream/10'); totalReqs++; successes++; } catch(_) { totalReqs++; failures++; }
+    await new Promise(r => setTimeout(r, 1000));
+    try { await doRequest('https://httpbin.org/get'); } catch(_) {}
+    await new Promise(r => setTimeout(r, 1000));
+  }
+}
+async function phase5() { // Chaos mix
+  currentPhase = 'Phase 5: Chaos mix';
+  const end = Date.now() + 30*60*1000;
+  while (running && Date.now() < end) {
+    const r = Math.random();
+    try {
+      if (r < 0.1) await doRequest('https://expired.badssl.com/');
+      else if (r < 0.3) await doRequest('https://httpbin.org/bytes/100000');
+      else if (r < 0.5) { await soakFetchStreaming('https://httpbin.org/stream/5'); totalReqs++; successes++; }
+      else if (r < 0.7) await Promise.all([doRequest('https://httpbin.org/get'), doRequest('https://httpbin.org/ip')]);
+      else await doRequest('https://httpbin.org/get');
+    } catch(_) {}
+    await new Promise(r => setTimeout(r, 1000 + Math.random()*2000));
+  }
+}
+
+async function soakLoop() {
+  while (running) {
+    await phase1(); if (!running) break;
+    await phase2(); if (!running) break;
+    await phase3(); if (!running) break;
+    await phase4(); if (!running) break;
+    await phase5();
+  }
+}
+
+// ── Init ─────────────────────────────────────────────────────
+let diagInterval, uiInterval, chartInterval;
+
+window.toggleSoak = async function() {
+  if (running) {
+    running = false;
+    document.getElementById('startBtn').textContent = 'Start';
+    document.getElementById('startBtn').classList.remove('active');
+    clearInterval(diagInterval); clearInterval(uiInterval); clearInterval(chartInterval);
+    addLog('info', 'Soak test stopped');
+    updateUI();
+    return;
+  }
+  if (!wasm) {
+    addLog('info', 'Initializing WASM...');
+    await wasmInit();
+    wasm = true;
+    addLog('info', 'WASM initialized');
+  }
+  running = true;
+  startTime = Date.now();
+  totalReqs = 0; successes = 0; failures = 0;
+  latencies = []; heapSamples = []; logEntries = [];
+  initialHeap = parseFloat(getHeapMB()) || 50;
+  document.getElementById('startBtn').textContent = 'Stop';
+  document.getElementById('startBtn').classList.add('active');
+  addLog('info', 'Soak test started');
+
+  uiInterval = setInterval(updateUI, 1000);
+  diagInterval = setInterval(() => {
+    const heap = parseFloat(getHeapMB()) || 0;
+    heapSamples.push({ time: Date.now(), heap });
+    if (heapSamples.length > MAX_HEAP) heapSamples.shift();
+    if (heap > initialHeap * 3) addLog('warn', `Heap grew to ${heap}MB (initial: ${initialHeap}MB)`);
+    try {
+      const d = atua_diagnostics();
+      if (d.wispStreams > 0) addLog('warn', `${d.wispStreams} Wisp streams still open`);
+    } catch(_) {}
+  }, 10000);
+  chartInterval = setInterval(drawChart, 30000);
+
+  soakLoop();
+};
+</script>
+</body>
+</html>

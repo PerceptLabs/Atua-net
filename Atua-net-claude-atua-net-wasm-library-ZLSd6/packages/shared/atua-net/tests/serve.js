@@ -1,11 +1,9 @@
 /**
- * Test server: static files + local binary endpoint + self-contained Wisp v1 relay.
+ * Test server: static files + local binary endpoint + self-contained Wisp v1 relay
+ * with fault injection for Tier 19 chaos tests.
  *
  * Static server: http://localhost:3456
  * Wisp relay:    ws://localhost:3457
- *
- * The relay implements the full Wisp v1 protocol (TCP + UDP) without wisp-js.
- * No pause/resume on TCP sockets — Node.js handles backpressure internally.
  */
 import { createServer } from 'node:http';
 import { readFile } from 'node:fs/promises';
@@ -27,10 +25,68 @@ const MIME_TYPES = {
   '.css': 'text/css',
 };
 
-// ── Static file server + local binary endpoint ────────────────
+// ── Relay Fault Injection State ──────────────────────────────
+
+const relayControl = {
+  dropStream: false,       // destroy next TCP stream after 1024 bytes
+  stallStream: false,      // buffer next stream's data for 5s before forwarding
+  killWebSocket: false,    // close WS 500ms after next CONNECT
+  sendGarbage: false,      // send malformed frame alongside next DATA
+};
+
+// ── Static file server + control routes + binary endpoint ────
 
 const staticServer = createServer(async (req, res) => {
   const url = req.url.split('?')[0];
+
+  // Relay control routes
+  if (url === '/relay/drop-stream') {
+    relayControl.dropStream = true;
+    res.writeHead(200, { 'Access-Control-Allow-Origin': '*' });
+    res.end('ok');
+    return;
+  }
+  if (url === '/relay/stall-stream') {
+    relayControl.stallStream = true;
+    res.writeHead(200, { 'Access-Control-Allow-Origin': '*' });
+    res.end('ok');
+    return;
+  }
+  if (url === '/relay/kill-websocket') {
+    relayControl.killWebSocket = true;
+    res.writeHead(200, { 'Access-Control-Allow-Origin': '*' });
+    res.end('ok');
+    return;
+  }
+  if (url === '/relay/send-garbage') {
+    relayControl.sendGarbage = true;
+    res.writeHead(200, { 'Access-Control-Allow-Origin': '*' });
+    res.end('ok');
+    return;
+  }
+  if (url === '/relay/reset') {
+    relayControl.dropStream = false;
+    relayControl.stallStream = false;
+    relayControl.killWebSocket = false;
+    relayControl.sendGarbage = false;
+    res.writeHead(200, { 'Access-Control-Allow-Origin': '*' });
+    res.end('ok');
+    return;
+  }
+
+  // Soak test page
+  if (url === '/soak') {
+    try {
+      const content = await readFile(join(__dirname, 'soak.html'));
+      res.writeHead(200, { 'Content-Type': 'text/html', 'Access-Control-Allow-Origin': '*' });
+      res.end(content);
+      return;
+    } catch {
+      res.writeHead(404);
+      res.end('soak.html not found');
+      return;
+    }
+  }
 
   // Local /bytes/:n endpoint for large transfer tests
   const bytesMatch = url.match(/^\/bytes\/(\d+)$/);
@@ -75,7 +131,7 @@ staticServer.listen(3456, () => {
   console.log('Static server on http://localhost:3456');
 });
 
-// ── Wisp v1 Relay (self-contained) ──────────────────────────────
+// ── Wisp v1 Relay (self-contained, with fault injection) ────
 
 const BUFFER_SIZE = 128;
 const CONTINUE_INTERVAL = 64;
@@ -122,9 +178,9 @@ function mapErrorToCloseReason(code) {
 }
 
 function handleConnection(ws) {
-  const streams = new Map(); // streamId → { socket, type: 'tcp'|'udp', framesSent }
+  const streams = new Map();
 
-  // Send initial CONTINUE (stream_id=0, buffer_remaining=BUFFER_SIZE)
+  // Send initial CONTINUE (stream_id=0)
   ws.send(encodeContinue(0, BUFFER_SIZE));
 
   ws.on('message', (data) => {
@@ -139,14 +195,65 @@ function handleConnection(ws) {
         const port = frame.payload.readUInt16LE(1);
         const hostname = frame.payload.subarray(3).toString('utf-8').trim();
 
+        // Fault: kill-websocket — schedule WS close after this CONNECT
+        if (relayControl.killWebSocket) {
+          relayControl.killWebSocket = false;
+          setTimeout(() => { try { ws.close(); } catch (_) {} }, 500);
+        }
+
+        // Check if this stream should be faulted
+        const shouldDrop = relayControl.dropStream;
+        const shouldStall = relayControl.stallStream;
+        if (shouldDrop) relayControl.dropStream = false;
+        if (shouldStall) relayControl.stallStream = false;
+
         if (streamType === 0x01) {
           // TCP
           const socket = net.createConnection({ port, host: hostname, family: 4 });
-          const entry = { socket, type: 'tcp', framesSent: 0 };
+          const entry = { socket, type: 'tcp', framesSent: 0, bytesForwarded: 0, stalling: shouldStall, stallBuffer: [] };
           streams.set(frame.streamId, entry);
 
           socket.on('data', (chunk) => {
-            if (ws.readyState !== 1) return; // WebSocket.OPEN
+            if (ws.readyState !== 1) return;
+
+            // Fault: drop-stream — destroy after threshold
+            if (shouldDrop) {
+              entry.bytesForwarded += chunk.length;
+              if (entry.bytesForwarded > 1024) {
+                socket.destroy();
+                if (ws.readyState === 1) ws.send(encodeClose(frame.streamId, 0x03));
+                streams.delete(frame.streamId);
+                return;
+              }
+            }
+
+            // Fault: stall-stream — buffer data, flush after 5s
+            if (entry.stalling) {
+              entry.stallBuffer.push(chunk);
+              if (!entry.stallTimer) {
+                entry.stallTimer = setTimeout(() => {
+                  entry.stalling = false;
+                  for (const buffered of entry.stallBuffer) {
+                    if (ws.readyState === 1) {
+                      ws.send(encodeData(frame.streamId, buffered));
+                      entry.framesSent++;
+                    }
+                  }
+                  entry.stallBuffer = [];
+                  if (entry.framesSent % CONTINUE_INTERVAL === 0 && ws.readyState === 1) {
+                    ws.send(encodeContinue(frame.streamId, BUFFER_SIZE));
+                  }
+                }, 5000);
+              }
+              return;
+            }
+
+            // Fault: send-garbage — inject malformed frame
+            if (relayControl.sendGarbage) {
+              relayControl.sendGarbage = false;
+              ws.send(Buffer.from([0xFF, 0x00, 0x00, 0x00, 0x00, 0xDE, 0xAD]));
+            }
+
             ws.send(encodeData(frame.streamId, chunk));
             entry.framesSent++;
             if (entry.framesSent % CONTINUE_INTERVAL === 0) {
@@ -155,9 +262,7 @@ function handleConnection(ws) {
           });
 
           socket.on('end', () => {
-            if (ws.readyState === 1) {
-              ws.send(encodeClose(frame.streamId, 0x02));
-            }
+            if (ws.readyState === 1) ws.send(encodeClose(frame.streamId, 0x02));
             streams.delete(frame.streamId);
           });
 
@@ -167,9 +272,7 @@ function handleConnection(ws) {
 
           socket.on('error', (err) => {
             const reason = mapErrorToCloseReason(err.code);
-            if (ws.readyState === 1) {
-              ws.send(encodeClose(frame.streamId, reason));
-            }
+            if (ws.readyState === 1) ws.send(encodeClose(frame.streamId, reason));
             streams.delete(frame.streamId);
           });
         } else if (streamType === 0x02) {
@@ -189,15 +292,11 @@ function handleConnection(ws) {
 
           socket.on('error', (err) => {
             const reason = mapErrorToCloseReason(err.code);
-            if (ws.readyState === 1) {
-              ws.send(encodeClose(frame.streamId, reason));
-            }
+            if (ws.readyState === 1) ws.send(encodeClose(frame.streamId, reason));
             streams.delete(frame.streamId);
           });
 
-          socket.bind(() => {
-            socket.connect(port, hostname);
-          });
+          socket.bind(() => { socket.connect(port, hostname); });
         }
         break;
       }
@@ -229,22 +328,16 @@ function handleConnection(ws) {
 
   ws.on('close', () => {
     for (const [, entry] of streams) {
-      if (entry.type === 'tcp') {
-        entry.socket.destroy();
-      } else {
-        try { entry.socket.close(); } catch (_) {}
-      }
+      if (entry.type === 'tcp') entry.socket.destroy();
+      else try { entry.socket.close(); } catch (_) {}
     }
     streams.clear();
   });
 
   ws.on('error', () => {
     for (const [, entry] of streams) {
-      if (entry.type === 'tcp') {
-        entry.socket.destroy();
-      } else {
-        try { entry.socket.close(); } catch (_) {}
-      }
+      if (entry.type === 'tcp') entry.socket.destroy();
+      else try { entry.socket.close(); } catch (_) {}
     }
     streams.clear();
   });

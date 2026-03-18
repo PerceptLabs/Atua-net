@@ -7,7 +7,7 @@
 <body>
   <h1>atua-net test harness</h1>
   <script type="module">
-    import init, { atua_fetch, atua_fetch_streaming, atua_connect, atua_stream_send, atua_stream_recv, atua_stream_close, atua_websocket, atua_ws_send, atua_ws_recv, atua_ws_close } from '../wasm-pkg/atua_net.js';
+    import init, { atua_fetch, atua_fetch_streaming, atua_connect, atua_stream_send, atua_stream_recv, atua_stream_close, atua_websocket, atua_ws_send, atua_ws_recv, atua_ws_close, atua_diagnostics } from '../wasm-pkg/atua_net.js';
     import { WispConnection } from '../node_modules/@mercuryworkshop/wisp-client-js/src/wisp.mjs';
 
     // ── Wisp Client Bridge ─────────────────────────────────────
@@ -128,6 +128,7 @@
     // ── Global test API ────────────────────────────────────────
 
     window.__atuaNet = { init, atua_fetch, atua_connect, atua_stream_send, atua_stream_recv, atua_stream_close };
+    window.__atuaDiagnostics = () => atua_diagnostics();
     window.__atuaNetReady = false;
     window.__atuaNetNative = _useNativeWisp;
     window.__WispBridge = WispBridge;
